@@ -1,7 +1,16 @@
 import { Ionicons } from '@expo/vector-icons';
+import { StatusBar } from 'expo-status-bar';
 import { Tabs, usePathname, useRouter } from 'expo-router';
 import { useEffect, useRef } from 'react';
-import { Animated, Easing, Image, StyleSheet, useWindowDimensions, View } from 'react-native';
+import {
+  Animated,
+  Easing,
+  Image,
+  StyleSheet,
+  useWindowDimensions,
+  View,
+  type ColorValue,
+} from 'react-native';
 import {
   GestureHandlerRootView,
   PanGestureHandler,
@@ -16,9 +25,11 @@ import { useWorkoutActive } from '../lib/workoutLock';
 // отдельно ставить ничего не нужно.
 type IconName = React.ComponentProps<typeof Ionicons>['name'];
 
+// color приходит от навигатора как ColorValue (строка или непрозрачный
+// нативный цвет), а не как string — Ionicons принимает и то, и другое.
 const icon =
   (name: IconName) =>
-  ({ color, size }: { color: string; size: number }) => (
+  ({ color, size }: { color: ColorValue; size: number }) => (
     <Ionicons name={name} size={size} color={color} />
   );
 
@@ -199,6 +210,11 @@ const styles = StyleSheet.create({
 export default function Layout() {
   return (
     <GestureHandlerRootView style={{ flex: 1 }}>
+      {/* Экраны приложения всегда светлые (белый фон, светло-красный во
+          время подхода), поэтому иконки статус-бара тёмные жёстко, а не
+          "auto": auto смотрит на системную тему устройства и в тёмной делал
+          их белыми — по белому фону их просто не было видно. */}
+      <StatusBar style="dark" />
       <LanguageProvider>
         <TabsInner />
       </LanguageProvider>

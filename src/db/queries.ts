@@ -320,15 +320,37 @@ export async function resumeSet(setId: number): Promise<void> {
   );
 }
 
+/**
+ * Правка повторов и веса. Пишутся только переданные поля — те, которых в
+ * values нет, остаются как были.
+ *
+ * Раньше здесь был COALESCE(?, reps), и «поле не передали» было неотличимо
+ * от «поле очистили»: стереть ошибочно введённый вес было невозможно,
+ * старое значение возвращалось обратно. Смотрим на наличие ключа, а не на
+ * его значение — тогда null однозначно значит «стереть».
+ */
 export async function updateSetValues(
   setId: number,
   values: { reps?: number | null; weightKg?: number | null }
 ): Promise<void> {
+  const assignments: string[] = [];
+  const args: (number | null)[] = [];
+
+  if ('reps' in values) {
+    assignments.push('reps = ?');
+    args.push(values.reps ?? null);
+  }
+  if ('weightKg' in values) {
+    assignments.push('weight_kg = ?');
+    args.push(values.weightKg ?? null);
+  }
+  if (assignments.length === 0) return;
+
   const db = await getDb();
-  await db.runAsync(
-    'UPDATE sets SET reps = COALESCE(?, reps), weight_kg = COALESCE(?, weight_kg) WHERE id = ?',
-    [values.reps ?? null, values.weightKg ?? null, setId]
-  );
+  await db.runAsync(`UPDATE sets SET ${assignments.join(', ')} WHERE id = ?`, [
+    ...args,
+    setId,
+  ]);
 }
 
 export async function deleteSet(setId: number): Promise<void> {
@@ -393,31 +415,58 @@ export async function getRoutinePrefill(routineId: number): Promise<PrefillRow[]
     [routineId]
   );
 
-  if (!last) {
-    return db.getAllAsync<PrefillRow>(
-      `SELECT e.id AS exercise_id, e.name, e.measurement_default, re.position,
-              NULL AS reps, NULL AS weight_kg
-       FROM routine_exercises re
-       JOIN exercises e ON e.id = re.exercise_id
-       WHERE re.routine_id = ?
-       ORDER BY re.position`,
-      [routineId]
-    );
-  }
-
-  return db.getAllAsync<PrefillRow>(
-    `
-    SELECT e.id AS exercise_id, e.name, e.measurement_default, re.position,
-           s.reps, s.weight_kg
-    FROM routine_exercises re
-    JOIN exercises e ON e.id = re.exercise_id
-    LEFT JOIN sets s ON s.exercise_id = e.id AND s.workout_id = ?
-    LEFT JOIN set_times t ON t.set_id = s.id
-    WHERE re.routine_id = ?
-    ORDER BY re.position, t.started_at, s.id
-    `,
-    [last.id, routineId]
+  // Состав шаблона: то, с чего тренировка начинается в самый первый раз,
+  // и запасной вариант для упражнений, которых в прошлый раз не делали.
+  const template = await db.getAllAsync<PrefillRow>(
+    `SELECT e.id AS exercise_id, e.name, e.measurement_default, re.position,
+            NULL AS reps, NULL AS weight_kg
+     FROM routine_exercises re
+     JOIN exercises e ON e.id = re.exercise_id
+     WHERE re.routine_id = ? AND e.is_archived = 0
+     ORDER BY re.position`,
+    [routineId]
   );
+
+  if (!last) return template;
+
+  /*
+   * Заготовка повторяет ПРОШЛУЮ ТРЕНИРОВКУ, а не состав шаблона.
+   *
+   * Раньше она строилась от routine_exercises, и всё, чего в шаблоне нет,
+   * до следующего раза не доживало: упражнение, добавленное по ходу
+   * тренировки, попадает только в workout_exercise_order, а в шаблон — нет.
+   * Вместе с ним пропадали и его подходы с повторами и весами — ровно то,
+   * ради чего заготовка и нужна. Прошлая тренировка знает и добавленные
+   * упражнения, и порядок, и число подходов, поэтому отталкиваемся от неё.
+   */
+  const previous = await db.getAllAsync<PrefillRow>(
+    `
+    SELECT e.id AS exercise_id, e.name, e.measurement_default,
+           COALESCE(o.position, 999999) AS position,
+           s.reps, s.weight_kg
+    FROM sets s
+    JOIN exercises e ON e.id = s.exercise_id
+    LEFT JOIN workout_exercise_order o
+           ON o.workout_id = s.workout_id AND o.exercise_id = s.exercise_id
+    WHERE s.workout_id = ? AND e.is_archived = 0
+    ORDER BY COALESCE(o.position, 999999), s.exercise_id, s.position, s.id
+    `,
+    [last.id]
+  );
+
+  // Упражнение могли дописать в шаблон уже после прошлой тренировки — тогда
+  // его там нет, и оно идёт в конец пустой строкой.
+  const seen = new Set(previous.map((r) => r.exercise_id));
+  const rows = [...previous, ...template.filter((r) => !seen.has(r.exercise_id))];
+
+  // position пришёл из двух разных источников (порядок прошлой тренировки и
+  // порядок шаблона), и числа в них не связаны между собой. Нумеруем заново,
+  // иначе beginWorkout разложит упражнения по случайно совпавшим значениям.
+  const order = new Map<number, number>();
+  for (const r of rows) {
+    if (!order.has(r.exercise_id)) order.set(r.exercise_id, order.size);
+  }
+  return rows.map((r) => ({ ...r, position: order.get(r.exercise_id)! }));
 }
 
 /* ------------------------------------------------------------------ */

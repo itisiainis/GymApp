@@ -318,12 +318,17 @@ export async function getRoutine(
 /* ---------------- Итоги тренировки ---------------- */
 
 export interface RecapSet {
+  /** id подхода: разбор повторяет раскладку тренировки, и отдых там тоже
+   *  привязан к подходу, а не к его номеру в списке. */
+  id: number;
   exercise_id: number;
   exercise_name: string;
   measurement_default: 'reps' | 'hold';
   reps: number | null;
   weight_kg: number | null;
   active_seconds: number;
+  started_at: string | null;
+  ended_at: string | null;
   /** Рекорд: результат лучше всего, что было по этому упражнению раньше. */
   is_pr: number;
 }
@@ -351,8 +356,8 @@ export async function getWorkoutRecap(workoutId: number): Promise<RecapSet[]> {
         AND w.started_at < (SELECT started_at FROM workouts WHERE id = ?)
       GROUP BY s.exercise_id
     )
-    SELECT s.exercise_id, e.name AS exercise_name, e.measurement_default,
-           s.reps, s.weight_kg, t.active_seconds,
+    SELECT s.id, s.exercise_id, e.name AS exercise_name, e.measurement_default,
+           s.reps, s.weight_kg, t.active_seconds, t.started_at, t.ended_at,
            CASE
              WHEN e.measurement_default = 'hold'
                THEN CASE WHEN t.active_seconds > COALESCE(p.best_seconds, 0) THEN 1 ELSE 0 END
@@ -364,8 +369,12 @@ export async function getWorkoutRecap(workoutId: number): Promise<RecapSet[]> {
     JOIN exercises e ON e.id = s.exercise_id
     JOIN set_times t ON t.set_id = s.id
     LEFT JOIN prior p ON p.exercise_id = s.exercise_id
+    LEFT JOIN workout_exercise_order o
+           ON o.workout_id = s.workout_id AND o.exercise_id = s.exercise_id
     WHERE s.workout_id = ?
-    ORDER BY s.id
+    -- тот же порядок, что и на экране тренировки (getWorkoutSetsLive):
+    -- разбор повторяет её раскладку, значит и упражнения должны идти так же
+    ORDER BY COALESCE(o.position, 999999), s.exercise_id, s.position, s.id
     `,
     [workoutId, workoutId]
   );

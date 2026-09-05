@@ -20,6 +20,8 @@ export interface SetRowLive {
   reps: number | null;
   weight_kg: number | null;
   started_at: string | null;
+  /** Конец последнего закрытого интервала — от него считается отдых. */
+  ended_at: string | null;
   active_seconds: number;
   is_running: number;
   /** Начало открытого интервала. NULL, если подход не идёт. */
@@ -67,12 +69,6 @@ export async function beginWorkout(routineId: number): Promise<number> {
     }
   }
 
-  // Шаблон запускается впервые — упражнения есть, подходов нет.
-  // Даём по одной пустой строке на упражнение.
-  if (prefill.every((r) => r.reps === null && r.weight_kg === null)) {
-    // addSetDraft выше уже создал по строке на каждое упражнение шаблона
-  }
-
   return workoutId;
 }
 
@@ -87,7 +83,7 @@ export async function getWorkoutSetsLive(workoutId: number): Promise<SetRowLive[
     SELECT s.id, s.workout_id, s.exercise_id, s.reps, s.weight_kg,
            e.name AS exercise_name,
            e.measurement_default,
-           t.started_at, t.active_seconds, t.is_running,
+           t.started_at, t.ended_at, t.active_seconds, t.is_running,
            (SELECT i.started_at FROM set_intervals i
             WHERE i.set_id = s.id AND i.ended_at IS NULL
             LIMIT 1) AS running_since
@@ -127,6 +123,11 @@ export interface PreviousSet {
 /**
  * Подходы из последней завершённой тренировки, где встречалось упражнение.
  * Показываем в карточке тренировки, чтобы было видно, от чего отталкиваться.
+ *
+ * Список упражнений здесь должен совпадать с тем, что разложит
+ * getRoutinePrefill: состав шаблона ПЛЮС всё, что добавили по ходу прошлой
+ * тренировки. Иначе добавленное упражнение попадает в заготовку, но на
+ * экране перед стартом стоит с пометкой «пусто», хотя история у него есть.
  */
 export async function getPreviousSets(routineId: number): Promise<PreviousSet[]> {
   const db = await getDb();
@@ -140,6 +141,13 @@ export async function getPreviousSets(routineId: number): Promise<PreviousSet[]>
     WHERE w.ended_at IS NOT NULL
       AND s.exercise_id IN (
             SELECT exercise_id FROM routine_exercises WHERE routine_id = ?
+            UNION
+            SELECT s3.exercise_id FROM sets s3
+            WHERE s3.workout_id = (
+                    SELECT id FROM workouts
+                    WHERE routine_id = ? AND ended_at IS NOT NULL
+                    ORDER BY started_at DESC LIMIT 1
+                  )
           )
       AND w.id = (
             SELECT w2.id FROM workouts w2
@@ -149,7 +157,7 @@ export async function getPreviousSets(routineId: number): Promise<PreviousSet[]>
           )
     ORDER BY s.exercise_id, t.started_at, s.id
     `,
-    [routineId]
+    [routineId, routineId]
   );
 }
 

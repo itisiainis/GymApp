@@ -43,20 +43,22 @@ import {
 } from '../db/workout-session';
 import { DEFAULT_RECORDING, getRecordingSettings, type RecordingSettings } from '../db/settings';
 import { useT } from '../lib/i18n';
-import { fmt, fmtSigned, liveSeconds, useNow } from '../lib/time';
+import { fmt, fmtSigned, lastEndedAt, liveSeconds, restBySet, useNow } from '../lib/time';
+import {
+  HEADER_DONE,
+  HEADER_DONE_PAUSED,
+  HEADER_DONE_TEXT,
+  HEADER_GREY,
+  HEADER_GREY_TEXT,
+  RED,
+  RED_DARK,
+  REST_BG,
+  REST_HINT,
+  REST_TEXT,
+  REST_VALUE,
+  SET_DONE_BG,
+} from '../lib/theme';
 import { setWorkoutActive } from '../lib/workoutLock';
-
-const RED = '#e8c4c4';
-const RED_DARK = '#b23c3c';
-/** Шапка упражнения: серая, пока есть незакрытые подходы, и зелёная, когда все готовы. */
-const HEADER_GREY = '#4a5054';
-const HEADER_GREY_TEXT = '#ffffff';
-/** Светлая заливка, а не насыщенная: насыщенный зелёный читается как кнопка. */
-const HEADER_DONE = '#cfe9d8';
-const HEADER_DONE_TEXT = '#1f6b38';
-/** Готовая плашка на паузе: тот же зелёный, но с красным подмесом — иначе
- *  плашка выглядит так же, как во время обычной записи, и паузу не видно. */
-const HEADER_DONE_PAUSED = '#dcb3b0';
 
 /** Секунда на сворачивание: движение должно читаться, а не мигать. */
 const COLLAPSE_MS = 1000;
@@ -116,14 +118,40 @@ export default function Session() {
 
   const running = rows.find((r) => r.is_running === 1) ?? null;
   const paused = workout?.is_paused === 1;
-  const locked = running !== null || paused;
-  const barLocked = running !== null;
+
+  /**
+   * Запирает экран только ИДУЩИЙ подход: пока таймер тикает, править веса и
+   * переставлять карточки нечего — это тот подход, который прямо сейчас
+   * делают.
+   *
+   * Пауза сюда больше не входит. Раньше она запирала всё то же самое, и на
+   * паузе нельзя было ни добавить упражнение, ни поправить вес — а пауза как
+   * раз для этого и нужна. Теперь она меняет только фон.
+   */
+  const locked = running !== null;
+  /** Красная заливка — и на идущем подходе, и на паузе. */
+  const redBackground = running !== null || paused;
 
   /** Подходы без отметки о выполнении — неважно, таймером или одним тапом. */
   const unrecorded = rows.filter((r) => !r.started_at).length;
 
   // во время перетаскивания тикающий таймер перерисовывал бы весь список
   const now = useNow(workout !== null && !dragging);
+
+  // Отдых, который уже сложился между записанными подходами: подписывается
+  // к каждому из них и дальше не меняется.
+  const restBefore = restBySet(rows);
+  /**
+   * Идущий отдых: время с конца последнего записанного подхода. Пока подход
+   * идёт, отдыха нет — там тикает свой таймер, и два счётчика рядом сбивали
+   * бы с толку. На паузе отдых считается: пауза — это тоже отдых, просто
+   * объявленный.
+   */
+  const lastEnd = lastEndedAt(rows);
+  const restNow =
+    running === null && lastEnd !== null
+      ? Math.max(0, (now - Date.parse(lastEnd)) / 1000)
+      : null;
 
   // Каждый await рвёт автобатчинг React 18 - если звать setState между
   // ними, экран перерисовывался бы отдельно на каждый запрос к базе, и
@@ -478,7 +506,7 @@ export default function Session() {
     }
 
     body = (
-    <View style={{ flex: 1, backgroundColor: locked ? RED : '#fff' }}>
+    <View style={{ flex: 1, backgroundColor: redBackground ? RED : '#fff' }}>
       <ScrollView
         style={{ flex: 1 }}
         scrollEnabled={!dragging && !setsDragging}
@@ -610,48 +638,67 @@ export default function Session() {
                         await setExerciseSetOrder(workout!.id, g.exerciseId, order);
                       }}
                       renderItem={(s, _i, isSetBeingDragged, startSetDrag) => (
-                        <View style={{ flexDirection: 'row', alignItems: 'center', gap: 2 }}>
-                          {/* Отдельная зона для драга: сама строка подхода
-                              почти целиком из полей ввода, зажать точно
-                              на них не выйдет - а тут выделенная ручка. */}
-                          <Pressable
-                            disabled={locked || s.is_running === 1 || g.sets.length < 2}
-                            onLongPress={startSetDrag}
-                            delayLongPress={200}
-                            hitSlop={8}
-                            style={{
-                              paddingHorizontal: 4,
-                              opacity: locked || s.is_running === 1 ? 0.2 : 1,
-                            }}
-                          >
-                            <Text style={{ color: '#bbb', fontSize: 16 }}>≡</Text>
-                          </Pressable>
-
-                          <View
-                            style={{
-                              flex: 1,
-                              backgroundColor: isSetBeingDragged ? '#e2eef7' : 'transparent',
-                              borderRadius: 6,
-                            }}
-                          >
-                            <SwipeRow
-                              disabled={locked || s.is_running === 1}
-                              onDelete={async () => {
-                                await deleteSet(s.id);
-                                refresh();
+                        <View>
+                          {/* Сколько отдыхали перед этим подходом. Стоит над
+                              ним, а не под предыдущим: отдых — это то, с чем
+                              подход подошёл к штанге, и читается он вместе
+                              со строкой, к которой относится. */}
+                          {restBefore[s.id] !== undefined && (
+                            <Text
+                              style={{
+                                fontSize: 11,
+                                color: REST_HINT,
+                                paddingLeft: 14,
+                                paddingBottom: 2,
                               }}
                             >
-                              <SetLine
-                                row={s}
-                                locked={locked && s.is_running !== 1}
-                                timed={rec.advancedReps || s.measurement_default === 'hold'}
-                                seconds={liveSeconds(s.active_seconds, s.running_since, now)}
-                                onChanged={refresh}
-                                // при «Finish anyway» показываем, каких
-                                // именно подходов не хватает
-                                flagged={confirmFinish && !s.started_at}
-                              />
-                            </SwipeRow>
+                              ⏱ {t('rest')} {fmt(restBefore[s.id])}
+                            </Text>
+                          )}
+
+                          <View style={{ flexDirection: 'row', alignItems: 'center', gap: 2 }}>
+                            {/* Отдельная зона для драга: сама строка подхода
+                                почти целиком из полей ввода, зажать точно
+                                на них не выйдет - а тут выделенная ручка. */}
+                            <Pressable
+                              disabled={locked || s.is_running === 1 || g.sets.length < 2}
+                              onLongPress={startSetDrag}
+                              delayLongPress={200}
+                              hitSlop={8}
+                              style={{
+                                paddingHorizontal: 4,
+                                opacity: locked || s.is_running === 1 ? 0.2 : 1,
+                              }}
+                            >
+                              <Text style={{ color: '#bbb', fontSize: 16 }}>≡</Text>
+                            </Pressable>
+
+                            <View
+                              style={{
+                                flex: 1,
+                                backgroundColor: isSetBeingDragged ? '#e2eef7' : 'transparent',
+                                borderRadius: 6,
+                              }}
+                            >
+                              <SwipeRow
+                                disabled={locked || s.is_running === 1}
+                                onDelete={async () => {
+                                  await deleteSet(s.id);
+                                  refresh();
+                                }}
+                              >
+                                <SetLine
+                                  row={s}
+                                  locked={locked && s.is_running !== 1}
+                                  timed={rec.advancedReps || s.measurement_default === 'hold'}
+                                  seconds={liveSeconds(s.active_seconds, s.running_since, now)}
+                                  onChanged={refresh}
+                                  // при «Finish anyway» показываем, каких
+                                  // именно подходов не хватает
+                                  flagged={confirmFinish && !s.started_at}
+                                />
+                              </SwipeRow>
+                            </View>
                           </View>
                         </View>
                       )}
@@ -744,81 +791,116 @@ export default function Session() {
         />
       )}
 
-      <View
-        onLayout={(e) => setBarHeight(e.nativeEvent.layout.height)}
-        style={{
-          flexDirection: 'row',
-          alignItems: 'center',
-          gap: 10,
-          padding: 12,
-          borderTopWidth: 1,
-          borderTopColor: '#00000015',
-          backgroundColor: '#fff',
-        }}
-      >
-        <Text style={{ flex: 1, fontSize: 16 }}>
-          {t('Total')}: {fmt(total)}
-          {paused ? ` (${t('paused')})` : ''}
-        </Text>
+      {/* Полоса отдыха и панель меряются вместе: облако с предупреждением
+          висит над ними обеими, и по высоте одной панели оно наезжало бы
+          на отдых. */}
+      <View onLayout={(e) => setBarHeight(e.nativeEvent.layout.height)}>
+        {restNow !== null && (
+          <View
+            style={{
+              flexDirection: 'row',
+              alignItems: 'baseline',
+              justifyContent: 'center',
+              gap: 8,
+              paddingVertical: 6,
+              backgroundColor: REST_BG,
+              borderTopWidth: 1,
+              borderTopColor: '#00000010',
+            }}
+          >
+            <Text style={{ color: REST_TEXT, fontSize: 13, fontWeight: '600' }}>
+              {t('Rest')}
+            </Text>
+            <Text
+              style={{
+                color: REST_VALUE,
+                fontSize: 22,
+                fontWeight: '700',
+                // моноширинные цифры: без них строка дёргается на каждой
+                // секунде, потому что цифры разной ширины
+                fontVariant: ['tabular-nums'],
+              }}
+            >
+              {fmt(restNow)}
+            </Text>
+          </View>
+        )}
 
-        <Pressable
-          disabled={barLocked}
-          onPress={async () => {
-            if (paused) {
-              await resumeWorkout(workout!.id);
-            } else {
-              await pauseWorkout(workout!.id);
-            }
-            refresh();
-          }}
+        <View
           style={{
-            paddingVertical: 10,
-            paddingHorizontal: 14,
-            backgroundColor: '#4aa3df',
-            borderRadius: 8,
-            opacity: barLocked ? 0.3 : 1,
+            flexDirection: 'row',
+            alignItems: 'center',
+            gap: 10,
+            padding: 12,
+            borderTopWidth: 1,
+            borderTopColor: '#00000015',
+            backgroundColor: '#fff',
           }}
         >
-          <Text style={{ color: '#fff' }}>{paused ? t('Resume') : t('Pause')}</Text>
-        </Pressable>
-
-        <Pressable
-          disabled={barLocked}
-          onPress={async () => {
-            if (unrecorded > 0 && !confirmFinish) {
-              setConfirmFinish(true);
-              // раскрываем упражнения с невыполненными сетами, если их
-              // свернули руками - иначе пульсацию просто не видно
-              const withUnrecorded = new Set(
-                rows.filter((r) => !r.started_at).map((r) => r.exercise_id)
-              );
-              setCollapsed((c) => {
-                const next = { ...c };
-                for (const id of withUnrecorded) next[id] = false;
-                return next;
-              });
-              return;
-            }
-            const id = workout!.id;
-            const secs = await getWorkoutTotalSeconds(id);
-            await endWorkout(id);
-            setConfirmFinish(false);
-            setRecapTotal(secs);
-            setRecapId(id);
-            refresh();
-          }}
-          style={{
-            paddingVertical: 10,
-            paddingHorizontal: 14,
-            backgroundColor: RED_DARK,
-            borderRadius: 8,
-            opacity: barLocked ? 0.3 : 1,
-          }}
-        >
-          <Text style={{ color: '#fff' }}>
-            {confirmFinish ? t('Finish anyway') : t('Finish')}
+          <Text style={{ flex: 1, fontSize: 16 }}>
+            {t('Total')}: {fmt(total)}
+            {paused ? ` (${t('paused')})` : ''}
           </Text>
-        </Pressable>
+
+          <Pressable
+            disabled={locked}
+            onPress={async () => {
+              if (paused) {
+                await resumeWorkout(workout!.id);
+              } else {
+                await pauseWorkout(workout!.id);
+              }
+              refresh();
+            }}
+            style={{
+              paddingVertical: 10,
+              paddingHorizontal: 14,
+              backgroundColor: '#4aa3df',
+              borderRadius: 8,
+              opacity: locked ? 0.3 : 1,
+            }}
+          >
+            <Text style={{ color: '#fff' }}>{paused ? t('Resume') : t('Pause')}</Text>
+          </Pressable>
+
+          <Pressable
+            disabled={locked}
+            onPress={async () => {
+              if (unrecorded > 0 && !confirmFinish) {
+                setConfirmFinish(true);
+                // раскрываем упражнения с невыполненными сетами, если их
+                // свернули руками - иначе пульсацию просто не видно
+                const withUnrecorded = new Set(
+                  rows.filter((r) => !r.started_at).map((r) => r.exercise_id)
+                );
+                setCollapsed((c) => {
+                  const next = { ...c };
+                  for (const id of withUnrecorded) next[id] = false;
+                  return next;
+                });
+                return;
+              }
+              const id = workout!.id;
+              const secs = await getWorkoutTotalSeconds(id);
+              await endWorkout(id);
+              setConfirmFinish(false);
+              setRecapTotal(secs);
+              setRecapId(id);
+              refresh();
+            }}
+            style={{
+              paddingVertical: 10,
+              paddingHorizontal: 14,
+              backgroundColor: RED_DARK,
+              borderRadius: 8,
+              opacity: locked ? 0.3 : 1,
+            }}
+          >
+            <Text style={{ color: '#fff' }}>
+              {confirmFinish ? t('Finish anyway') : t('Finish')}
+            </Text>
+          </Pressable>
+        </View>
       </View>
 
       <ExercisePicker
@@ -971,7 +1053,7 @@ function SetLine({
     : isRunning
       ? '#ffffff'
       : isDone
-        ? '#e3f4e9'
+        ? SET_DONE_BG
         : 'transparent';
 
   return (
