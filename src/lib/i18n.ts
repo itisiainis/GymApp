@@ -76,10 +76,27 @@ const RU: Record<string, string> = {
   kg: 'кг',
   sec: 'сек',
 
+  // RIR
+  RIR: 'RIR',
+  "Didn't reach": 'не дотянул',
+
+  // старт тренировки
+  'Or copy a previous workout': 'Или повторить прошлую тренировку',
+  'Or start from a template': 'Или взять шаблон',
+  Workout: 'Тренировка',
+
   // шаблоны
-  'No workouts yet': 'Тренировок пока нет',
-  'Exercises in this workout': 'Упражнения в тренировке',
-  'This workout has no exercises yet': 'В этой тренировке пока нет упражнений',
+  Templates: 'Шаблоны',
+  'Templates hint':
+    'Шаблон — заранее записанный состав тренировки. Необязателен: тренировку можно собрать с нуля и сохранить шаблоном уже после неё.',
+  'New template': 'Новый шаблон',
+  'Edit template': 'Изменить шаблон',
+  'No templates yet': 'Шаблонов пока нет',
+  'This template has no exercises yet': 'В этом шаблоне пока нет упражнений',
+  // из saveWorkoutAsRoutine: сохранять в шаблон нечего
+  'This workout has no exercises yet': 'В этой тренировке нет упражнений',
+  'Save as a template': 'Сохранить как шаблон',
+  'Saved as a template': 'Сохранено как шаблон',
 
   // упражнения
   Mine: 'Мои',
@@ -100,15 +117,18 @@ const RU: Record<string, string> = {
   'Hold and drag to reorder': 'Зажми и перетащи, чтобы поменять порядок',
   'Exercise not found': 'Упражнение не найдено',
   'Built-in exercises cannot be edited': 'Встроенные упражнения нельзя менять',
-  'This workout already has recorded sessions': 'По этой тренировке уже есть записи',
   'A workout is already in progress': 'Тренировка уже идёт',
   'Set not found': 'Подход не найден',
   'Another set is already running': 'Другой подход уже идёт',
   'Only the last set can be resumed': 'Продолжить можно только последний подход',
   'Name is required': 'Нужно название',
-  'Pick muscles and set percentages': 'Выбери мышцы и проставь проценты',
+  'Pick at least one muscle': 'Выбери хотя бы одну мышцу',
+  'Mark at least one muscle as primary': 'Отметь хотя бы одну мышцу главной',
   'No muscle selected yet': 'Ни одна мышца не выбрана',
-  'Split evenly': 'Поровну',
+  'Tap a muscle to switch between primary and secondary':
+    'Тап по мышце переключает её между главной и вторичной',
+  Primary: 'Главная',
+  Secondary: 'Вторичная',
   'By group': 'По группам',
   Alphabetical: 'По алфавиту',
   'used in workouts': 'в тренировках',
@@ -121,9 +141,10 @@ const RU: Record<string, string> = {
 
   // настройки
   Language: 'Язык',
-  'Advanced rep recording': 'Продвинутая запись подходов',
-  'Advanced rep recording hint': 'По умолчанию подход на повторы отмечается одним тапом. Упражнения на время меряются таймером всегда.',
-  'Time every set': 'Мерить время каждого подхода',
+  'Recording rep sets': 'Запись подходов на повторы',
+  'Recording rep sets hint':
+    'По умолчанию подход на повторы засчитывается через RIR — сколько повторов осталось в запасе. Секундомер можно включить вместо него. Упражнения на время меряются таймером всегда.',
+  'Record sets with a stopwatch': 'Записывать подходы секундомером',
   'Trim hint': 'Секунды, которые не считаются рабочими: дойти до снаряда и вернуться к телефону.',
   'Trim at start': 'Срезать в начале, сек',
   'Trim at end': 'Срезать в конце, сек',

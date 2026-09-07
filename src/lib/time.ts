@@ -1,11 +1,27 @@
 import { useEffect, useState } from 'react';
 
-/** Секунды → 12:46 */
+/** Секунды → 12:46. Для сводок: там доли секунды только мешают. */
 export function fmt(totalSeconds: number): string {
   const s = Math.max(0, Math.floor(totalSeconds));
   const m = Math.floor(s / 60);
   const rest = s % 60;
   return `${m}:${String(rest).padStart(2, '0')}`;
+}
+
+/**
+ * Секунды → 12:46.317. Для всего, что меряется и потом вычитается:
+ * длительность подхода, отдых, общее время.
+ *
+ * Целые секунды врали при вычитании, и это сбивало с толку: между 0:07 и
+ * 0:12 на экране ровно пять секунд, а на деле от 4.01 до 5.99 — обе
+ * границы округлены в свою сторону. С миллисекундами вычитать можно то,
+ * что видишь.
+ */
+export function fmtMs(totalSeconds: number): string {
+  const total = Math.max(0, totalSeconds);
+  const whole = Math.floor(total);
+  const ms = Math.floor((total - whole) * 1000);
+  return `${fmt(whole)}.${String(ms).padStart(3, '0')}`;
 }
 
 /**
@@ -19,6 +35,12 @@ export function fmtSigned(totalSeconds: number): string {
   return fmt(totalSeconds);
 }
 
+/** То же с миллисекундами: -0:04.317 */
+export function fmtSignedMs(totalSeconds: number): string {
+  if (totalSeconds < 0) return `-${fmtMs(-totalSeconds)}`;
+  return fmtMs(totalSeconds);
+}
+
 /**
  * Возвращает текущее время, обновляясь раз в секунду.
  *
@@ -26,15 +48,15 @@ export function fmtSigned(totalSeconds: number): string {
  * компоненты по их входам, и Date.now() внутри рендера для него невидим —
  * зависимость от времени должна быть явной, иначе строка «замерзает».
  */
-export function useNow(active: boolean): number {
+export function useNow(active: boolean, intervalMs = 500): number {
   const [now, setNow] = useState(() => Date.now());
 
   useEffect(() => {
     if (!active) return;
     setNow(Date.now());
-    const id = setInterval(() => setNow(Date.now()), 500);
+    const id = setInterval(() => setNow(Date.now()), intervalMs);
     return () => clearInterval(id);
-  }, [active]);
+  }, [active, intervalMs]);
 
   return now;
 }

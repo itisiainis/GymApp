@@ -37,7 +37,7 @@ export default function Workouts() {
     <ScrollView style={{ flex: 1, backgroundColor: '#fff' }}>
       <View style={{ padding: 16, paddingTop: 48, gap: 10 }}>
         <View style={{ flexDirection: 'row', alignItems: 'center' }}>
-          <Text style={{ flex: 1, fontSize: 24, fontWeight: '700' }}>{t('Workouts')}</Text>
+          <Text style={{ flex: 1, fontSize: 24, fontWeight: '700' }}>{t('Templates')}</Text>
           <Pressable
             onPress={() => {
               setEditId(null);
@@ -51,10 +51,15 @@ export default function Workouts() {
             }}
           >
             <Text style={{ color: '#fff', fontWeight: '700', fontSize: 16 }}>
-              {t('New workout')}
+              {t('New template')}
             </Text>
           </Pressable>
         </View>
+
+        {/* Шаблон — вторичная вещь: тренировка собирается с нуля, а шаблон
+            берётся, когда он как раз есть, или сохраняется постфактум из
+            уже сделанной тренировки. */}
+        <Text style={{ color: '#888', fontSize: 13 }}>{t('Templates hint')}</Text>
 
         <TextInput
           placeholder={t('Search')}
@@ -72,7 +77,7 @@ export default function Workouts() {
 
         {filtered.length === 0 && (
           <Text style={{ color: '#999' }}>
-            {items.length === 0 ? t('No workouts yet') : t('Nothing found')}
+            {items.length === 0 ? t('No templates yet') : t('Nothing found')}
           </Text>
         )}
 
@@ -122,7 +127,7 @@ export default function Workouts() {
                 <View style={{ marginTop: 8, gap: 4 }}>
                   {exercises.length === 0 ? (
                     <Text style={{ color: '#999', fontSize: 13 }}>
-                      {t('This workout has no exercises yet')}
+                      {t('This template has no exercises yet')}
                     </Text>
                   ) : (
                     exercises.map((e, i) => (

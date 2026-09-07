@@ -1,49 +1,56 @@
 import { useFocusEffect } from 'expo-router';
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Animated, Pressable, ScrollView, Text, TextInput, View } from 'react-native';
+import { Animated, Easing, Pressable, ScrollView, Text, TextInput, View } from 'react-native';
+import { LiveTimer } from '../components/LiveTimer';
 import { ExerciseForm } from '../components/ExerciseForm';
 import { ExercisePicker } from '../components/ExercisePicker';
-import { RoutineForm } from '../components/RoutineForm';
 import { Collapsible } from '../components/Collapsible';
 import { ReorderableList } from '../components/ReorderableList';
+import { RirDrum } from '../components/RirDrum';
 import { SwipeRow } from '../components/SwipeRow';
 import { WorkoutRecap } from '../components/WorkoutRecap';
 import {
   addSetDraft,
+  cancelWorkoutClock,
   deleteSet,
   deleteWorkoutExercise,
+  discardWorkout,
   endWorkout,
   getActiveWorkout,
-  getRoutinePrefill,
   getWorkoutTotalSeconds,
   pauseWorkout,
   resumeWorkout,
   setExerciseNote,
   setExerciseSetOrder,
+  setSetRir,
   startSet,
+  startWorkoutClock,
   stopSet,
-  recordSet,
   recordSetSeconds,
   unrecordSet,
   updateSetValues,
   type ActiveWorkout,
-  type PrefillRow,
 } from '../db/queries';
 import {
-  beginWorkout,
-  ensureExerciseOrder,
+  addExerciseToWorkout,
+  copyRoutineInto,
+  copyWorkoutInto,
+  createDraftWorkout,
   getExerciseNotes,
-  getPreviousSets,
   getWorkoutSetsLive,
+  listRecentWorkouts,
   listRoutines,
+  refreshWorkoutName,
   setWorkoutExerciseOrder,
-  type PreviousSet,
+  type RecentWorkout,
   type Routine,
   type SetRowLive,
 } from '../db/workout-session';
 import { DEFAULT_RECORDING, getRecordingSettings, type RecordingSettings } from '../db/settings';
 import { useT } from '../lib/i18n';
-import { fmt, fmtSigned, lastEndedAt, liveSeconds, restBySet, useNow } from '../lib/time';
+import { hasRir, rirOf } from '../lib/rir';
+import { localizeWorkoutName } from '../lib/workoutName';
+import { fmtMs, lastEndedAt, liveSeconds, restBySet, useNow } from '../lib/time';
 import {
   HEADER_DONE,
   HEADER_DONE_PAUSED,
@@ -62,15 +69,20 @@ import { setWorkoutActive } from '../lib/workoutLock';
 
 /** Секунда на сворачивание: движение должно читаться, а не мигать. */
 const COLLAPSE_MS = 1000;
+/** Сколько закрытое упражнение ещё стоит открытым, прежде чем свернуться. */
+const AUTO_COLLAPSE_DELAY_MS = 10_000;
+/** Отсчёт перед стартом тренировки — время дойти до снаряда. */
+const COUNTDOWN_SECONDS = 5;
 /** Во время реордеринга сворачиваем быстрее — это техническая пауза, а не
  *  «упражнение закрыто», задерживать взгляд на ней незачем. */
 const COLLAPSE_FAST_MS = 200;
 
+/** Записан ли подход — единственное определение на весь экран. */
+type Recorded = (s: SetRowLive) => boolean;
+
 /** Все подходы записаны и ни один не идёт — упражнение можно считать закрытым. */
-function isGroupDone(sets: SetRowLive[]): boolean {
-  return (
-    sets.length > 0 && sets.every((s) => s.started_at !== null && s.is_running !== 1)
-  );
+function isGroupDone(sets: SetRowLive[], recorded: Recorded): boolean {
+  return sets.length > 0 && sets.every((s) => recorded(s) && s.is_running !== 1);
 }
 
 /**
@@ -78,8 +90,8 @@ function isGroupDone(sets: SetRowLive[]): boolean {
  * считается: обычно сначала записывают один подход, а потом дописывают
  * ещё, и сворачивать в этот момент рано - только мешает добавить следующий.
  */
-function shouldAutoCollapse(sets: SetRowLive[]): boolean {
-  return sets.length > 1 && isGroupDone(sets);
+function shouldAutoCollapse(sets: SetRowLive[], recorded: Recorded): boolean {
+  return sets.length > 1 && isGroupDone(sets, recorded);
 }
 
 export default function Session() {
@@ -90,18 +102,12 @@ export default function Session() {
   const [notes, setNotes] = useState<Record<number, string>>({});
   const [routines, setRoutines] = useState<Routine[]>([]);
 
-  // выбранная тренировка до старта: в базе ещё ничего нет
-  const [pending, setPending] = useState<number | null>(null);
-  const [preview, setPreview] = useState<PrefillRow[]>([]);
-  const [prevSets, setPrevSets] = useState<PreviousSet[]>([]);
-  const [countdown, setCountdown] = useState<number | null>(null);
+  // что предложить на пустом экране: чем занимались на этой неделе
+  const [recent, setRecent] = useState<RecentWorkout[]>([]);
 
   const [collapsed, setCollapsed] = useState<Record<number, boolean>>({});
   const [pickerOpen, setPickerOpen] = useState(false);
-  const [routineFormOpen, setRoutineFormOpen] = useState(false);
-  const [editRoutineId, setEditRoutineId] = useState<number | null>(null);
   const [editExerciseId, setEditExerciseId] = useState<number | null>(null);
-  const [total, setTotal] = useState(0);
   const [confirmFinish, setConfirmFinish] = useState(false);
   const [recapId, setRecapId] = useState<number | null>(null);
   const [recapTotal, setRecapTotal] = useState(0);
@@ -119,6 +125,19 @@ export default function Session() {
   const running = rows.find((r) => r.is_running === 1) ?? null;
   const paused = workout?.is_paused === 1;
 
+  /*
+   * Три состояния одного экрана, а не три экрана.
+   *
+   * Тренировка сначала собирается (черновик: began_at ещё нет), потом
+   * запускается. Отдельного экрана выбора и отдельного экрана «состав
+   * перед стартом» больше нет: состав виден там же, где потом идёт
+   * работа, и добавление упражнения ничего никуда не перекидывает.
+   */
+  const beganAt = workout?.began_at ?? null;
+  /** Часы запущены — но, возможно, ещё идёт отсчёт перед стартом. */
+  const clockSet = beganAt !== null;
+  const beganMs = beganAt === null ? 0 : Date.parse(beganAt);
+
   /**
    * Запирает экран только ИДУЩИЙ подход: пока таймер тикает, править веса и
    * переставлять карточки нечего — это тот подход, который прямо сейчас
@@ -132,11 +151,50 @@ export default function Session() {
   /** Красная заливка — и на идущем подходе, и на паузе. */
   const redBackground = running !== null || paused;
 
-  /** Подходы без отметки о выполнении — неважно, таймером или одним тапом. */
-  const unrecorded = rows.filter((r) => !r.started_at).length;
+  /**
+   * Чем засчитывается подход. Холды меряются временем всегда, повторы —
+   * только если включён секундомер; иначе повторы засчитывает RIR.
+   */
+  const isTimed = useCallback(
+    (s: SetRowLive) => rec.advancedReps || s.measurement_default === 'hold',
+    [rec.advancedReps]
+  );
+
+  /**
+   * Записан ли подход. У подхода с секундомером это время, у подхода на
+   * повторы — проставленный RIR. Одно определение на весь экран: по нему
+   * считаются и «незаписанные» для кнопки Finish, и готовность упражнения
+   * к сворачиванию, и подсветка при «Finish anyway». Разъедься они — и
+   * карточка сворачивалась бы как готовая, пока Finish пересчитывает её
+   * подходы в незаписанные.
+   */
+  const recorded = useCallback(
+    (s: SetRowLive) => (isTimed(s) ? s.started_at !== null : hasRir(s)),
+    [isTimed]
+  );
+
+  const unrecorded = rows.filter((s) => !recorded(s)).length;
 
   // во время перетаскивания тикающий таймер перерисовывал бы весь список
   const now = useNow(workout !== null && !dragging);
+
+  /** Отсчёт перед стартом ещё идёт: began_at стоит в будущем. */
+  const counting = clockSet && beganMs > now;
+  /** Тренировка идёт по-настоящему: отсчёт позади. */
+  const live = clockSet && !counting;
+
+  /**
+   * Момент окончания отсчёта надо поймать точно, а общий тик идёт раз в
+   * полсекунды — на глаз это заметная задержка смены подписей на кнопках.
+   * Отдельный таймер ровно на остаток отсчёта перерисовывает экран в тот
+   * самый момент.
+   */
+  const [, setCountdownTick] = useState(0);
+  useEffect(() => {
+    if (!counting) return;
+    const id = setTimeout(() => setCountdownTick((n) => n + 1), Math.max(0, beganMs - Date.now()));
+    return () => clearTimeout(id);
+  }, [counting, beganMs]);
 
   // Отдых, который уже сложился между записанными подходами: подписывается
   // к каждому из них и дальше не меняется.
@@ -148,10 +206,7 @@ export default function Session() {
    * объявленный.
    */
   const lastEnd = lastEndedAt(rows);
-  const restNow =
-    running === null && lastEnd !== null
-      ? Math.max(0, (now - Date.parse(lastEnd)) / 1000)
-      : null;
+  const restSince = running === null ? lastEnd : null;
 
   // Каждый await рвёт автобатчинг React 18 - если звать setState между
   // ними, экран перерисовывался бы отдельно на каждый запрос к базе, и
@@ -159,26 +214,79 @@ export default function Session() {
   // (это и читалось как мигание, например при добавлении упражнения).
   // Поэтому сначала дочитываем всё нужное в переменные, а стейт выставляем
   // одним синхронным проходом - React соберёт его в один рендер.
+  /**
+   * Значения, набранные прямо сейчас, — до того как они доедут до базы и
+   * вернутся в rows. Нужны «Добавить подход»: он копирует повторы и вес с
+   * предыдущего подхода, и копировать надо именно набранное, а не то, что
+   * успело сохраниться. Ref, а не состояние: перерисовка здесь не нужна и
+   * сбила бы каретку в поле, из которого сейчас печатают.
+   */
+  const typed = useRef<Record<number, { reps?: number | null; weightKg?: number | null }>>({});
+
+  const onTyped = useCallback(
+    (setId: number, patch: { reps?: number | null; weightKg?: number | null }) => {
+      typed.current[setId] = { ...typed.current[setId], ...patch };
+      updateSetValues(setId, patch);
+    },
+    []
+  );
+
+  /** Значения подхода с учётом того, что в него как раз печатают. */
+  const currentValues = (s: SetRowLive) => ({
+    reps: typed.current[s.id]?.reps ?? s.reps,
+    weightKg: typed.current[s.id]?.weightKg ?? s.weight_kg,
+  });
+
   const refresh = useCallback(async () => {
     const w = await getActiveWorkout();
     if (!w) {
-      const routineList = await listRoutines();
+      // Предлагать что-то есть смысл только на пустом экране, поэтому
+      // подсказки грузятся здесь, а не вместе с тренировкой.
+      const [routineList, recentList] = await Promise.all([
+        listRoutines(),
+        listRecentWorkouts(),
+      ]);
       setWorkout(null);
       setRows([]);
+      setNotes({});
       setRoutines(routineList);
+      setRecent(recentList);
       return;
     }
-    const [recSettings, liveRows, exerciseNotes] = await Promise.all([
+    const [recSettings, liveRows, exerciseNotes, routineList, recentList] = await Promise.all([
       getRecordingSettings(),
       getWorkoutSetsLive(w.id),
       getExerciseNotes(w.id),
+      listRoutines(),
+      listRecentWorkouts(),
     ]);
+    // Набранное, но ещё не доехавшее до базы, держим только для живых
+    // подходов: SQLite переиспользует id удалённых строк, и оставленная
+    // запись однажды подставила бы чужие цифры в новый подход.
+    const alive = new Set(liveRows.map((r) => r.id));
+    for (const key of Object.keys(typed.current)) {
+      if (!alive.has(Number(key))) delete typed.current[Number(key)];
+    }
+
     setWorkout(w);
-    setPending(null);
     setRec(recSettings);
     setRows(liveRows);
     setNotes(exerciseNotes);
+    setRoutines(routineList);
+    setRecent(recentList);
   }, []);
+
+  /**
+   * Черновик заводится по первому действию, а не при заходе на вкладку:
+   * иначе каждое открытие «Тренировки» оставляло бы за собой пустую.
+   */
+  const ensureDraft = useCallback(
+    async (routineId: number | null = null): Promise<number> => {
+      if (workout) return workout.id;
+      return createDraftWorkout(routineId);
+    },
+    [workout]
+  );
 
   useFocusEffect(
     useCallback(() => {
@@ -186,10 +294,12 @@ export default function Session() {
     }, [refresh])
   );
 
-  useEffect(() => {
-    if (!workout) return;
-    getWorkoutTotalSeconds(workout.id).then(setTotal);
-  }, [workout, now]);
+  /*
+   * Общее время больше не спрашивается у базы на каждый тик: оно
+   * складывается из began_at и слагаемых паузы, которые пришли вместе с
+   * тренировкой. С миллисекундами прежний способ означал бы поход в базу
+   * на каждый показанный знак.
+   */
 
   // Свайп между вкладками (_layout.tsx) выключаем на время тренировки:
   // иначе он конфликтует со свайпами удаления сета/упражнения на этом же
@@ -253,19 +363,30 @@ export default function Session() {
     const nowDone: Record<number, boolean> = {};
     const justFinished: number[] = [];
     byExercise.forEach((sets, exerciseId) => {
-      const done = shouldAutoCollapse(sets);
+      const done = shouldAutoCollapse(sets, recorded);
       nowDone[exerciseId] = done;
       if (done && !wasDone[exerciseId]) justFinished.push(exerciseId);
     });
     wasDoneRef.current = nowDone;
-    if (justFinished.length > 0) {
+
+    if (justFinished.length === 0) return;
+    // Не сразу: закрытое упражнение ещё десять секунд остаётся открытым.
+    // Записал последний подход — и обычно тут же смотришь, что получилось,
+    // или правишь опечатку в весе; мгновенно схлопнувшаяся карточка это
+    // отнимала, и её приходилось открывать обратно руками.
+    const id = setTimeout(() => {
       setCollapsed((c) => {
         const next = { ...c };
-        for (const id of justFinished) delete next[id];
+        for (const exerciseId of justFinished) {
+          // за эти секунды подход могли раззаписать — тогда сворачивать
+          // уже нечего, упражнение снова в работе
+          if (wasDoneRef.current[exerciseId]) delete next[exerciseId];
+        }
         return next;
       });
-    }
-  }, [rows]);
+    }, AUTO_COLLAPSE_DELAY_MS);
+    return () => clearTimeout(id);
+  }, [rows, recorded]);
 
   /**
    * Показывать ли карточку свёрнутой. dragging — то, что видно прямо
@@ -279,233 +400,137 @@ export default function Session() {
     return manual ?? allDone;
   };
 
-  /** Открыть тренировку до старта: показываем состав и прошлые результаты. */
-  const openPending = async (routineId: number) => {
-    setPending(routineId);
-    setCountdown(null);
-    setPreview(await getRoutinePrefill(routineId));
-    setPrevSets(await getPreviousSets(routineId));
+  /** Повторить тренировку недельной давности — прямо здесь, без перехода. */
+  const useRecentWorkout = async (sourceId: number) => {
+    const id = await ensureDraft();
+    await copyWorkoutInto(id, sourceId);
+    // добавленные упражнения показываем раскрытыми: их состав как раз и
+    // надо посмотреть, прежде чем начинать
+    setCollapsed({});
+    await refresh();
   };
 
-  // 5 секунд перед стартом — время дойти до снаряда
-  useEffect(() => {
-    if (countdown === null) return;
-    if (countdown === 0) {
-      setCountdown(null);
-      if (pending !== null) {
-        beginWorkout(pending).then(() => {
-          setPending(null);
-          setCollapsed({});
-          refresh();
-        });
-      }
+  /** То же самое из шаблона: он тоже просто раскладывает упражнения. */
+  const useRoutine = async (routineId: number) => {
+    const id = await ensureDraft(routineId);
+    // ensureDraft создаёт черновик уже с составом шаблона, а вот если
+    // черновик был — состав надо доложить
+    if (workout) await copyRoutineInto(id, routineId);
+    setCollapsed({});
+    await refresh();
+  };
+
+  /**
+   * Запуск: время ставится сразу, но на пять секунд вперёд. Эти пять
+   * секунд — обычный отсчёт по часам, а не таймер внутри приложения,
+   * поэтому свернуть приложение на них можно без последствий.
+   */
+  const startClock = async () => {
+    if (!workout) return;
+    await startWorkoutClock(workout.id, COUNTDOWN_SECONDS);
+    await refresh();
+  };
+
+  /**
+   * «Go back». До запуска — выбросить собранное; во время отсчёта —
+   * отменить запуск, вернувшись к сборке. Кнопка одна и подписана
+   * одинаково, потому что и делает одно и то же: шаг назад.
+   */
+  const goBack = async () => {
+    if (!workout) return;
+    if (counting) {
+      await cancelWorkoutClock(workout.id);
+    } else {
+      await discardWorkout(workout.id);
+    }
+    setCollapsed({});
+    setConfirmFinish(false);
+    await refresh();
+  };
+
+  const togglePause = async () => {
+    if (!workout) return;
+    if (paused) await resumeWorkout(workout.id);
+    else await pauseWorkout(workout.id);
+    await refresh();
+  };
+
+  const finishWorkout = async () => {
+    if (!workout) return;
+    if (unrecorded > 0 && !confirmFinish) {
+      setConfirmFinish(true);
+      // раскрываем упражнения с невыполненными сетами, если их свернули
+      // руками - иначе пульсацию просто не видно
+      const withUnrecorded = new Set(
+        rows.filter((s) => !recorded(s)).map((s) => s.exercise_id)
+      );
+      setCollapsed((c) => {
+        const next = { ...c };
+        for (const id of withUnrecorded) next[id] = false;
+        return next;
+      });
       return;
     }
-    const id = setTimeout(() => setCountdown((c) => (c === null ? null : c - 1)), 1000);
-    return () => clearTimeout(id);
-  }, [countdown, pending, refresh]);
+    const id = workout.id;
+    const secs = await getWorkoutTotalSeconds(id);
+    await endWorkout(id);
+    setConfirmFinish(false);
+    setRecapTotal(secs);
+    setRecapId(id);
+    await refresh();
+  };
 
-  /* ---------------- выбор тренировки ---------------- */
-
-  // Собираем экран в переменную и рендерим один раз в конце, вместе с
-  // WorkoutRecap - иначе он не попадал в дерево во время экранов до и до
-  // старта тренировки и всплывал не тогда, когда нужно.
-  let body: React.ReactNode;
-
-  if (!workout && pending === null) {
-    body = (
-      <ScrollView style={{ flex: 1, backgroundColor: '#fff' }}>
-        <View style={{ padding: 20, paddingTop: 56, gap: 12 }}>
-          <Text style={{ fontSize: 24, fontWeight: '700' }}>{t('Start a workout')}</Text>
-
-          {routines.length === 0 && (
-            <Text style={{ color: '#888' }}>{t('No workouts yet')}</Text>
-          )}
-
-          <Pressable
-            onPress={() => {
-              setEditRoutineId(null);
-              setRoutineFormOpen(true);
-            }}
-            style={{
-              padding: 14,
-              alignItems: 'center',
-              backgroundColor: '#4aa3df',
-              borderRadius: 10,
-            }}
-          >
-            <Text style={{ color: '#fff', fontWeight: '600' }}>{t('New workout')} +</Text>
-          </Pressable>
-
-          {routines.map((r) => (
-            <Pressable
-              key={r.id}
-              onPress={() => openPending(r.id)}
-              style={{ padding: 16, backgroundColor: '#00000008', borderRadius: 10 }}
-            >
-              <Text style={{ fontSize: 17, fontWeight: '600' }}>{r.name}</Text>
-              <Text style={{ color: '#888', fontSize: 13 }}>
-                {t('Exercises')}: {r.exercise_count}
-              </Text>
-            </Pressable>
-          ))}
-        </View>
-
-        <RoutineForm
-          visible={routineFormOpen}
-          routineId={editRoutineId}
-          onClose={() => setRoutineFormOpen(false)}
-          onSaved={() => {
-            setRoutineFormOpen(false);
-            refresh();
-          }}
-        />
-      </ScrollView>
-    );
-  } else if (!workout && pending !== null) {
-    const groups: { exerciseId: number; name: string; sets: PreviousSet[] }[] = [];
-    for (const ex of preview) {
-      if (!groups.some((g) => g.exerciseId === ex.exercise_id)) {
-        groups.push({
-          exerciseId: ex.exercise_id,
-          name: ex.name,
-          sets: prevSets.filter((p) => p.exercise_id === ex.exercise_id),
-        });
-      }
+  /**
+   * Плавный переход «собираем» → «идёт»: за те же пять секунд, что идёт
+   * отсчёт, проявляется таймер и зелёная кнопка становится красной.
+   *
+   * Значение восстанавливается из began_at, а не копится с нуля: вернулся
+   * в приложение на третьей секунде отсчёта — увидишь цвет и таймер
+   * такими, какими они должны быть к этому моменту, а не начало анимации.
+   */
+  const startAnim = useRef(new Animated.Value(0)).current;
+  useEffect(() => {
+    if (!clockSet) {
+      startAnim.setValue(0);
+      return;
     }
+    const total = COUNTDOWN_SECONDS * 1000;
+    const left = Math.max(0, beganMs - Date.now());
+    startAnim.setValue(Math.min(1, Math.max(0, 1 - left / total)));
+    if (left === 0) return;
+    const anim = Animated.timing(startAnim, {
+      toValue: 1,
+      duration: left,
+      easing: Easing.linear,
+      // цвет нативным драйвером не прогнать
+      useNativeDriver: false,
+    });
+    anim.start();
+    return () => anim.stop();
+  }, [clockSet, beganMs, startAnim]);
 
-    body = (
-      <View style={{ flex: 1, backgroundColor: '#fff' }}>
-        <ScrollView contentContainerStyle={{ padding: 12, paddingTop: 48 }}>
-          {groups.map((g) => {
-            // пустые упражнения свёрнуты, с прошлыми подходами — раскрыты
-            const isCollapsed = collapsed[g.exerciseId] ?? g.sets.length === 0;
-            return (
-              <View
-                key={g.exerciseId}
-                style={{
-                  marginBottom: 10,
-                  backgroundColor: '#00000008',
-                  borderRadius: 10,
-                  padding: 10,
-                }}
-              >
-                <View style={{ flexDirection: 'row', alignItems: 'center' }}>
-                  <Pressable
-                    style={{ flex: 1 }}
-                    onPress={() =>
-                      setCollapsed((c) => ({ ...c, [g.exerciseId]: !isCollapsed }))
-                    }
-                  >
-                    <Text style={{ fontSize: 18, fontWeight: '600' }}>
-                      {isCollapsed ? '▾' : '▴'} {g.name}
-                    </Text>
-                  </Pressable>
-                  <Pressable
-                    onPress={() => setEditExerciseId(g.exerciseId)}
-                    style={{ paddingHorizontal: 10, paddingVertical: 6 }}
-                  >
-                    <Text style={{ color: '#4aa3df', fontWeight: '600' }}>{t('Edit')}</Text>
-                  </Pressable>
-                </View>
+  const primaryColor = startAnim.interpolate({
+    inputRange: [0, 1],
+    outputRange: ['#3aa655', RED_DARK],
+  });
 
-                {!isCollapsed && (
-                  <View style={{ marginTop: 8, gap: 4 }}>
-                    {g.sets.length === 0 ? (
-                      <Text style={{ color: '#999', fontSize: 13 }}>{t('Nothing')}</Text>
-                    ) : (
-                      <>
-                        <Text style={{ fontSize: 11, color: '#999' }}>
-                          {t('Last time')} ·{' '}
-                          {new Date(g.sets[0].workout_started).toLocaleDateString()}
-                        </Text>
-                        {g.sets.map((p, i) => (
-                          <Text key={i} style={{ color: '#444', fontSize: 14 }}>
-                            {p.reps != null && p.weight_kg != null
-                              ? `${p.reps} × ${p.weight_kg} ${t('kg')}`
-                              : p.reps != null
-                                ? `${p.reps} ${t('reps')}`
-                                : p.active_seconds > 0
-                                  ? fmt(p.active_seconds)
-                                  : '—'}
-                          </Text>
-                        ))}
-                      </>
-                    )}
-                  </View>
-                )}
-              </View>
-            );
-          })}
-        </ScrollView>
-
-        {/* Let's start шире Back в отношении 4:3 */}
-        <View
-          style={{
-            flexDirection: 'row',
-            gap: 10,
-            padding: 12,
-            borderTopWidth: 1,
-            borderTopColor: '#00000015',
-          }}
-        >
-          <Pressable
-            onPress={() => setCountdown(countdown === null ? 5 : null)}
-            style={{
-              flex: 4,
-              padding: 16,
-              alignItems: 'center',
-              backgroundColor: countdown === null ? '#3aa655' : '#2c8746',
-              borderRadius: 10,
-            }}
-          >
-            <Text style={{ color: '#fff', fontWeight: '700', fontSize: 16 }}>
-              {countdown === null ? t("Let's start") : String(countdown)}
-            </Text>
-          </Pressable>
-
-          <Pressable
-            onPress={() => {
-              setCountdown(null);
-              setPending(null);
-            }}
-            style={{
-              flex: 3,
-              padding: 16,
-              alignItems: 'center',
-              backgroundColor: '#eee',
-              borderRadius: 10,
-            }}
-          >
-            <Text style={{ fontWeight: '600', fontSize: 16 }}>{t('Go back')}</Text>
-          </Pressable>
-        </View>
-
-        <ExerciseForm
-          visible={editExerciseId !== null}
-          exerciseId={editExerciseId}
-          onClose={() => setEditExerciseId(null)}
-          onSaved={async () => {
-            setEditExerciseId(null);
-            if (pending !== null) setPreview(await getRoutinePrefill(pending));
-          }}
-        />
-      </View>
-    );
-  } else {
-    /* ---------------- активная тренировка ---------------- */
-
-    const groups: { exerciseId: number; name: string; sets: SetRowLive[] }[] = [];
-    for (const row of rows) {
-      let g = groups.find((x) => x.exerciseId === row.exercise_id);
-      if (!g) {
-        g = { exerciseId: row.exercise_id, name: row.exercise_name, sets: [] };
-        groups.push(g);
-      }
-      g.sets.push(row);
+  /*
+   * Один экран на все состояния: пустой, собранный черновик, отсчёт и
+   * идущая тренировка отличаются только содержимым списка и нижними
+   * кнопками. Отдельных экранов выбора и предпросмотра больше нет —
+   * состав виден там же, где потом идёт работа.
+   */
+  const groups: { exerciseId: number; name: string; sets: SetRowLive[] }[] = [];
+  for (const row of rows) {
+    let g = groups.find((x) => x.exerciseId === row.exercise_id);
+    if (!g) {
+      g = { exerciseId: row.exercise_id, name: row.exercise_name, sets: [] };
+      groups.push(g);
     }
+    g.sets.push(row);
+  }
 
-    body = (
+  const body = (
     <View style={{ flex: 1, backgroundColor: redBackground ? RED : '#fff' }}>
       <ScrollView
         style={{ flex: 1 }}
@@ -513,6 +538,21 @@ export default function Session() {
         keyboardShouldPersistTaps="handled"
         contentContainerStyle={{ padding: 12, paddingTop: 48 }}
       >
+        {/* Имя тренировки, собранной с нуля, пересобирается по мере
+            добавления упражнений — показываем его здесь, иначе увидеть
+            его можно было бы только потом, в истории. */}
+        <Text
+          style={{
+            fontSize: 20,
+            fontWeight: '700',
+            paddingHorizontal: 2,
+            paddingBottom: 10,
+            color: workout?.title ? '#000' : '#aaa',
+          }}
+        >
+          {localizeWorkoutName(workout?.title ?? null, t) ?? t('Workout')}
+        </Text>
+
         <ReorderableList
           items={groups}
           keyOf={(g) => g.exerciseId}
@@ -533,8 +573,11 @@ export default function Session() {
           }}
           renderItem={(g, _i, isBeingDragged, startDrag) => {
           const hasRunning = g.sets.some((s) => s.is_running === 1);
-          const allDone = isGroupDone(g.sets);
-          const isCollapsed = displayCollapsed(g.exerciseId, shouldAutoCollapse(g.sets));
+          const allDone = isGroupDone(g.sets, recorded);
+          const isCollapsed = displayCollapsed(
+            g.exerciseId,
+            shouldAutoCollapse(g.sets, recorded)
+          );
           const headerText = allDone ? HEADER_DONE_TEXT : HEADER_GREY_TEXT;
 
           return (
@@ -557,6 +600,9 @@ export default function Session() {
                 disabled={locked}
                 onDelete={async () => {
                   await deleteWorkoutExercise(workout!.id, g.exerciseId);
+                  // имя собрано по мышцам упражнений — с уходом упражнения
+                  // оно может стать другим
+                  await refreshWorkoutName(workout!.id);
                   refresh();
                 }}
               >
@@ -652,7 +698,7 @@ export default function Session() {
                                 paddingBottom: 2,
                               }}
                             >
-                              ⏱ {t('rest')} {fmt(restBefore[s.id])}
+                              ⏱ {t('rest')} {fmtMs(restBefore[s.id])}
                             </Text>
                           )}
 
@@ -690,14 +736,32 @@ export default function Session() {
                                 <SetLine
                                   row={s}
                                   locked={locked && s.is_running !== 1}
-                                  timed={rec.advancedReps || s.measurement_default === 'hold'}
+                                  timed={isTimed(s)}
                                   seconds={liveSeconds(s.active_seconds, s.running_since, now)}
                                   onChanged={refresh}
+                                  onTyped={onTyped}
                                   // при «Finish anyway» показываем, каких
                                   // именно подходов не хватает
-                                  flagged={confirmFinish && !s.started_at}
+                                  flagged={confirmFinish && !recorded(s)}
                                 />
                               </SwipeRow>
+
+                              {/* Барабан снаружи SwipeRow, отдельной строкой:
+                                  оба жеста горизонтальные, и вложенные они
+                                  дерутся друг с другом — свайп по барабану
+                                  уезжал бы в удаление подхода. */}
+                              {!isTimed(s) && (
+                                <View style={{ paddingTop: 2, paddingBottom: 2 }}>
+                                  <RirDrum
+                                    value={rirOf(s)}
+                                    disabled={locked}
+                                    onChange={async (next) => {
+                                      await setSetRir(s.id, next);
+                                      refresh();
+                                    }}
+                                  />
+                                </View>
+                              )}
                             </View>
                           </View>
                         </View>
@@ -707,12 +771,22 @@ export default function Session() {
                     <Pressable
                       disabled={locked}
                       onPress={async () => {
+                        // Копируем значения предыдущего подхода вместе с
+                        // тем, что в него печатают прямо сейчас: обычно
+                        // новый подход добавляют сразу после того, как
+                        // вписали повторы в предыдущий, и заставлять
+                        // сначала «закрыть» поле незачем. Фокус при этом
+                        // не сбивается — за это отвечает
+                        // keyboardShouldPersistTaps у списка.
                         const last = g.sets[g.sets.length - 1];
+                        const from = last
+                          ? currentValues(last)
+                          : { reps: null, weightKg: null };
                         await addSetDraft(
                           workout!.id,
                           g.exerciseId,
-                          last?.reps ?? null,
-                          last?.weight_kg ?? null
+                          from.reps,
+                          from.weightKg
                         );
                         refresh();
                       }}
@@ -780,6 +854,74 @@ export default function Session() {
             {t('Hold an exercise name to reorder')}
           </Text>
         )}
+
+        {/* Подсказки — только пока в тренировке пусто. Как только состав
+            начали собирать, они перестают быть предложением и становятся
+            помехой: список упражнений уже есть, и он тут главный. */}
+        {groups.length === 0 && (
+          <View style={{ gap: 8, paddingTop: 4 }}>
+            {recent.length > 0 && (
+              <>
+                <Text style={{ fontWeight: '700', fontSize: 15, textAlign: 'center' }}>
+                  {t('Or copy a previous workout')}
+                </Text>
+                {recent.map((w) => (
+                  <Pressable
+                    key={w.id}
+                    onPress={() => useRecentWorkout(w.id)}
+                    style={{
+                      padding: 12,
+                      backgroundColor: '#00000010',
+                      borderRadius: 10,
+                    }}
+                  >
+                    <View style={{ flexDirection: 'row', alignItems: 'center' }}>
+                      <Text style={{ flex: 1, fontSize: 16, fontWeight: '600' }}>
+                        {localizeWorkoutName(w.title, t) ?? t('Workout')}
+                      </Text>
+                      <Text style={{ color: '#666', fontSize: 13 }}>
+                        {new Date(w.started_at).toLocaleDateString()}
+                      </Text>
+                    </View>
+                    {!!w.exercises && (
+                      <Text style={{ color: '#777', fontSize: 12, marginTop: 2 }}>
+                        {w.exercises}
+                      </Text>
+                    )}
+                  </Pressable>
+                ))}
+              </>
+            )}
+
+            {routines.length > 0 && (
+              <>
+                <Text
+                  style={{
+                    fontWeight: '600',
+                    fontSize: 14,
+                    textAlign: 'center',
+                    marginTop: 8,
+                    color: '#666',
+                  }}
+                >
+                  {t('Or start from a template')}
+                </Text>
+                {routines.map((r) => (
+                  <Pressable
+                    key={r.id}
+                    onPress={() => useRoutine(r.id)}
+                    style={{ padding: 12, backgroundColor: '#00000008', borderRadius: 10 }}
+                  >
+                    <Text style={{ fontSize: 15, fontWeight: '600' }}>{r.name}</Text>
+                    <Text style={{ color: '#888', fontSize: 12 }}>
+                      {t('Exercises')}: {r.exercise_count}
+                    </Text>
+                  </Pressable>
+                ))}
+              </>
+            )}
+          </View>
+        )}
       </ScrollView>
 
       {/* insets.bottom здесь не нужен: панель стоит над таббаром, а он уже
@@ -795,7 +937,7 @@ export default function Session() {
           висит над ними обеими, и по высоте одной панели оно наезжало бы
           на отдых. */}
       <View onLayout={(e) => setBarHeight(e.nativeEvent.layout.height)}>
-        {restNow !== null && (
+        {restSince !== null && (
           <View
             style={{
               flexDirection: 'row',
@@ -811,18 +953,10 @@ export default function Session() {
             <Text style={{ color: REST_TEXT, fontSize: 13, fontWeight: '600' }}>
               {t('Rest')}
             </Text>
-            <Text
-              style={{
-                color: REST_VALUE,
-                fontSize: 22,
-                fontWeight: '700',
-                // моноширинные цифры: без них строка дёргается на каждой
-                // секунде, потому что цифры разной ширины
-                fontVariant: ['tabular-nums'],
-              }}
-            >
-              {fmt(restNow)}
-            </Text>
+            <LiveTimer
+              since={restSince}
+              style={{ color: REST_VALUE, fontSize: 22, fontWeight: '700' }}
+            />
           </View>
         )}
 
@@ -837,67 +971,76 @@ export default function Session() {
             backgroundColor: '#fff',
           }}
         >
-          <Text style={{ flex: 1, fontSize: 16 }}>
-            {t('Total')}: {fmt(total)}
-            {paused ? ` (${t('paused')})` : ''}
-          </Text>
+          {/* Таймер проявляется за те же пять секунд, что идёт отсчёт:
+              до старта показывать нечего, а появиться разом в момент
+              старта — значит мигнуть. Пока идёт отсчёт, он показывает
+              время до начала со знаком минус. */}
+          {/* Подпись над значением, а не рядом: с миллисекундами строка
+              времени стала заметно длиннее, и в одну строку с ней подпись
+              съедала бы ширину у кнопок. */}
+          <Animated.View style={{ flex: 2, opacity: startAnim }}>
+            <Text style={{ fontSize: 11, color: '#888' }} numberOfLines={1}>
+              {t('Total')}
+            </Text>
+            <LiveTimer
+              since={beganAt}
+              base={-(workout?.paused_seconds ?? 0)}
+              until={workout?.paused_since ?? null}
+              signed
+              style={{ fontSize: 15, fontWeight: '700' }}
+            />
+          </Animated.View>
 
+          {/* Слева — то, что запускает и завершает: одна и та же кнопка,
+              которая за время отсчёта перекрашивается из зелёной в
+              красную. Подпись при этом не меняется до самого конца
+              отсчёта: пока идут пять секунд, отменить старт ещё можно,
+              и «Finish» на кнопке был бы обещанием другого действия. */}
+          <Animated.View style={{ flex: 3, borderRadius: 8, overflow: 'hidden', backgroundColor: primaryColor }}>
+            <Pressable
+              disabled={locked || (!clockSet && groups.length === 0)}
+              onPress={live ? finishWorkout : startClock}
+              style={{
+                paddingVertical: 14,
+                alignItems: 'center',
+                // до старта кнопка приглушена, пока в тренировке пусто:
+                // начинать нечего
+                opacity: locked || (!clockSet && groups.length === 0) ? 0.4 : 1,
+              }}
+            >
+              <Text style={{ color: '#fff', fontWeight: '700', fontSize: 16 }}>
+                {!live
+                  ? t("Let's start")
+                  : confirmFinish
+                    ? t('Finish anyway')
+                    : t('Finish')}
+              </Text>
+            </Pressable>
+          </Animated.View>
+
+          {/* Справа — серая кнопка: сначала выход из сборки, потом пауза.
+              Синей она становится только когда на паузе, то есть когда
+              нажата: цвет тут показывает состояние, а не приглашение. */}
           <Pressable
             disabled={locked}
-            onPress={async () => {
-              if (paused) {
-                await resumeWorkout(workout!.id);
-              } else {
-                await pauseWorkout(workout!.id);
-              }
-              refresh();
-            }}
+            onPress={live ? togglePause : goBack}
             style={{
-              paddingVertical: 10,
-              paddingHorizontal: 14,
-              backgroundColor: '#4aa3df',
+              flex: 2,
+              paddingVertical: 14,
+              alignItems: 'center',
+              backgroundColor: paused ? '#4aa3df' : '#eee',
               borderRadius: 8,
-              opacity: locked ? 0.3 : 1,
+              opacity: locked ? 0.4 : 1,
             }}
           >
-            <Text style={{ color: '#fff' }}>{paused ? t('Resume') : t('Pause')}</Text>
-          </Pressable>
-
-          <Pressable
-            disabled={locked}
-            onPress={async () => {
-              if (unrecorded > 0 && !confirmFinish) {
-                setConfirmFinish(true);
-                // раскрываем упражнения с невыполненными сетами, если их
-                // свернули руками - иначе пульсацию просто не видно
-                const withUnrecorded = new Set(
-                  rows.filter((r) => !r.started_at).map((r) => r.exercise_id)
-                );
-                setCollapsed((c) => {
-                  const next = { ...c };
-                  for (const id of withUnrecorded) next[id] = false;
-                  return next;
-                });
-                return;
-              }
-              const id = workout!.id;
-              const secs = await getWorkoutTotalSeconds(id);
-              await endWorkout(id);
-              setConfirmFinish(false);
-              setRecapTotal(secs);
-              setRecapId(id);
-              refresh();
-            }}
-            style={{
-              paddingVertical: 10,
-              paddingHorizontal: 14,
-              backgroundColor: RED_DARK,
-              borderRadius: 8,
-              opacity: locked ? 0.3 : 1,
-            }}
-          >
-            <Text style={{ color: '#fff' }}>
-              {confirmFinish ? t('Finish anyway') : t('Finish')}
+            <Text
+              style={{
+                color: paused ? '#fff' : '#333',
+                fontWeight: '600',
+                fontSize: 16,
+              }}
+            >
+              {!live ? t('Go back') : paused ? t('Resume') : t('Pause')}
             </Text>
           </Pressable>
         </View>
@@ -907,8 +1050,12 @@ export default function Session() {
         visible={pickerOpen}
         onClose={() => setPickerOpen(false)}
         onPick={async (exerciseId) => {
-          await addSetDraft(workout!.id, exerciseId, null, null);
-          await ensureExerciseOrder(workout!.id, exerciseId);
+          // Первое добавленное упражнение и заводит черновик: до этого
+          // момента тренировки в базе нет вовсе.
+          const id = await ensureDraft();
+          // упражнение приходит со своей заготовкой подходов из прошлого
+          // исполнения и пересчитывает имя тренировки
+          await addExerciseToWorkout(id, exerciseId);
           // без await шторка закрывалась бы до того, как экран под ней
           // обновится, - см. комментарий в ExercisePicker.confirm
           await refresh();
@@ -925,12 +1072,11 @@ export default function Session() {
         }}
       />
     </View>
-    );
-  }
+  );
 
-  // Рендерится всегда, независимо от того, какой из трёх экранов выше
-  // сейчас активен - иначе финальный отчёт всплывал только когда
-  // начиналась следующая тренировка, а не сразу после этой.
+  // WorkoutRecap стоит снаружи body: он должен пережить смену состояния
+  // экрана, иначе финальный отчёт всплывал бы только когда начнётся
+  // следующая тренировка, а не сразу после этой.
   return (
     <>
       {body}
@@ -1000,12 +1146,21 @@ function Cloud({ text, bottom }: { text: string; bottom: number }) {
 /* Строка подхода                                                      */
 /* ------------------------------------------------------------------ */
 
+/** Пустое поле — это «стереть значение», а не ноль. */
+function parseField(text: string): number | null {
+  const v = text.trim();
+  if (v === '') return null;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
 function SetLine({
   row,
   locked,
   timed,
   seconds,
   onChanged,
+  onTyped,
   flagged,
 }: {
   row: SetRowLive;
@@ -1015,6 +1170,8 @@ function SetLine({
   /** Уже посчитанное время: родитель пересчитывает его каждые полсекунды. */
   seconds: number;
   onChanged: () => void;
+  /** Введённое прямо сейчас — до того, как оно доедет до базы и обратно. */
+  onTyped: (setId: number, patch: { reps?: number | null; weightKg?: number | null }) => void;
   /** Подход мешает завершить тренировку — пульсируем, чтобы его нашли. */
   flagged: boolean;
 }) {
@@ -1068,16 +1225,19 @@ function SetLine({
         paddingVertical: 4,
       }}
     >
+      {/* Значения пишутся на каждый введённый знак, а не по уходу из
+          поля. Так «Добавить подход» видит только что набранные повторы,
+          не заставляя сначала где-то нажать, чтобы поле закрылось, — и
+          набранное не теряется, если приложение закроют прямо сейчас.
+          Экран при этом не обновляется: поля неуправляемые, и обновление
+          сбило бы каретку. */}
       <TextInput
         editable={!locked}
         keyboardType="numeric"
         placeholder={t('kg')}
         defaultValue={row.weight_kg == null ? '' : String(row.weight_kg)}
-        onEndEditing={async (e) => {
-          const v = e.nativeEvent.text.trim();
-          await updateSetValues(row.id, { weightKg: v === '' ? null : Number(v) });
-          onChanged();
-        }}
+        onChangeText={(v) => onTyped(row.id, { weightKg: parseField(v) })}
+        onEndEditing={onChanged}
         style={[inputStyle, { backgroundColor: locked ? 'transparent' : '#fff' }]}
       />
 
@@ -1086,58 +1246,58 @@ function SetLine({
         keyboardType="numeric"
         placeholder={t('reps')}
         defaultValue={row.reps == null ? '' : String(row.reps)}
-        onEndEditing={async (e) => {
-          const v = e.nativeEvent.text.trim();
-          await updateSetValues(row.id, { reps: v === '' ? null : Number(v) });
-          onChanged();
-        }}
+        onChangeText={(v) => onTyped(row.id, { reps: parseField(v) })}
+        onEndEditing={onChanged}
         style={[inputStyle, { backgroundColor: locked ? 'transparent' : '#fff' }]}
       />
 
-      <Pressable
-        disabled={locked}
-        onPress={async () => {
-          if (timed) {
+      {/* Кнопка записи осталась только у секундомера. Подход на повторы
+          засчитывает барабан RIR — он стоит отдельной строкой под этой,
+          снаружи SwipeRow (см. session.tsx выше и RirDrum). */}
+      {timed && (
+        <Pressable
+          disabled={locked}
+          onPress={async () => {
             if (isRunning) await stopSet(row.id);
             else await startSet(row.id);
-          } else {
-            // один тап: отметил — снял отметку
-            if (isDone) await unrecordSet(row.id);
-            else await recordSet(row.id);
-          }
-          onChanged();
-        }}
-        style={{
-          paddingVertical: 8,
-          paddingHorizontal: 12,
-          backgroundColor: isRunning
-            ? RED_DARK
-            : locked
-              ? '#00000020'
-              : isDone
-                ? '#2c8746'
-                : '#3aa655',
-          borderRadius: 6,
-        }}
-      >
-        <Text style={{ color: '#fff', fontWeight: '700' }}>
-          {timed ? (isRunning ? '❚❚' : isDone ? '✓' : '▶') : isDone ? '✓' : '○'}
-        </Text>
-      </Pressable>
+            onChanged();
+          }}
+          style={{
+            paddingVertical: 8,
+            paddingHorizontal: 12,
+            backgroundColor: isRunning
+              ? RED_DARK
+              : locked
+                ? '#00000020'
+                : isDone
+                  ? '#2c8746'
+                  : '#3aa655',
+            borderRadius: 6,
+          }}
+        >
+          <Text style={{ color: '#fff', fontWeight: '700' }}>
+            {isRunning ? '❚❚' : isDone ? '✓' : '▶'}
+          </Text>
+        </Pressable>
+      )}
 
       {timed &&
         (isRunning ? (
-          // во время самого подхода значение тикает — редактировать нечего
-          <Text
+          // Во время самого подхода значение тикает — редактировать
+          // нечего. Тикает оно у себя внутри, с миллисекундами: общий
+          // счётчик экрана для такой частоты не годится, он тянул бы за
+          // собой весь список.
+          <LiveTimer
+            since={row.running_since}
+            base={row.active_seconds}
+            signed
             style={{
-              width: 56,
+              width: 78,
               textAlign: 'right',
               color: prepping ? '#999' : undefined,
               fontWeight: prepping ? '600' : undefined,
             }}
-          >
-            {fmtSigned(seconds)}
-          </Text>
+          />
         ) : (
           // ручной ввод секунд — для тех, кто засекает внешним секундомером
           // и не хочет держаться за прижимной таймер приложения
@@ -1164,7 +1324,7 @@ function SetLine({
               inputStyle,
               {
                 flex: 0,
-                width: 56,
+                width: 78,
                 textAlign: 'right',
                 backgroundColor: locked ? 'transparent' : '#fff',
                 color: isDone ? '#2c8746' : undefined,

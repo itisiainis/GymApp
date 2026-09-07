@@ -99,8 +99,17 @@ export default function Exercises() {
             </Text>
             {muscles.length > 0 ? (
               muscles.map((m) => (
-                <Text key={m.muscle_id} style={{ fontSize: 13 }}>
-                  {t(m.name)} — {Math.round(m.share * 100)}%
+                <Text
+                  key={m.muscle_id}
+                  style={{
+                    fontSize: 13,
+                    // главные выделены жирным, вторичные приглушены -
+                    // так список читается без подписи роли у каждой строки
+                    fontWeight: m.role === 'primary' ? '700' : '400',
+                    color: m.role === 'primary' ? '#222' : '#777',
+                  }}
+                >
+                  {t(m.name)}
                 </Text>
               ))
             ) : (

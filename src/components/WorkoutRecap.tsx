@@ -1,9 +1,11 @@
 import { useEffect, useState } from 'react';
-import { Pressable, ScrollView, Text, View } from 'react-native';
-import { getWorkoutRecap, type RecapSet } from '../db/library';
-import { getExerciseNotes } from '../db/workout-session';
+import { Pressable, ScrollView, Text, TextInput, View } from 'react-native';
+import { getWorkoutMeta, getWorkoutRecap, type RecapSet } from '../db/library';
+import { getExerciseNotes, saveWorkoutAsRoutine } from '../db/workout-session';
 import { useT } from '../lib/i18n';
-import { fmt, restBySet } from '../lib/time';
+import { rirCompact } from '../lib/rir';
+import { fmtMs, restBySet } from '../lib/time';
+import { localizeWorkoutName } from '../lib/workoutName';
 import {
   CARD_BG,
   PR_BG,
@@ -41,6 +43,14 @@ export function WorkoutRecap({
   const { t } = useT();
   const [sets, setSets] = useState<RecapSet[]>([]);
   const [notes, setNotes] = useState<Record<number, string>>({});
+  /** Тренировка была по шаблону — тогда сохранять её как шаблон незачем. */
+  const [fromRoutine, setFromRoutine] = useState(true);
+  /** null — форму сохранения ещё не открывали; строка — что в ней введено. */
+  const [routineName, setRoutineName] = useState<string | null>(null);
+  /** Что предложить в поле: имя самой тренировки. */
+  const [suggestedName, setSuggestedName] = useState('');
+  const [savedRoutine, setSavedRoutine] = useState(false);
+  const [saveError, setSaveError] = useState('');
 
   useEffect(() => {
     if (workoutId === null) return;
@@ -48,8 +58,21 @@ export function WorkoutRecap({
     // тренировки под заголовком текущей.
     setSets([]);
     setNotes({});
+    setFromRoutine(true);
+    setRoutineName(null);
+    setSuggestedName('');
+    setSavedRoutine(false);
+    setSaveError('');
     getWorkoutRecap(workoutId).then(setSets);
     getExerciseNotes(workoutId).then(setNotes);
+    getWorkoutMeta(workoutId).then((m) => {
+      setFromRoutine(m?.routine_id != null);
+      setSuggestedName(localizeWorkoutName(m?.title ?? null, t) ?? '');
+    });
+    // t сюда не нужен: имя предлагается один раз, в момент открытия, и
+    // дальше его правит пользователь — переводить введённое задним числом
+    // значило бы менять чужой текст.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [workoutId]);
 
   const prs = sets.filter((s) => s.is_pr === 1);
@@ -66,10 +89,10 @@ export function WorkoutRecap({
   }
 
   const label = (s: RecapSet) => {
-    if (s.measurement_default === 'hold' && s.active_seconds > 0) return fmt(s.active_seconds);
+    if (s.measurement_default === 'hold' && s.active_seconds > 0) return fmtMs(s.active_seconds);
     if (s.reps != null && s.weight_kg != null) return `${s.reps} × ${s.weight_kg} ${t('kg')}`;
     if (s.reps != null) return `${s.reps} ${t('reps')}`;
-    if (s.active_seconds > 0) return fmt(s.active_seconds);
+    if (s.active_seconds > 0) return fmtMs(s.active_seconds);
     return '—';
   };
 
@@ -165,7 +188,7 @@ export function WorkoutRecap({
                         paddingBottom: 2,
                       }}
                     >
-                      ⏱ {t('rest')} {fmt(restBefore[s.id])}
+                      ⏱ {t('rest')} {fmtMs(restBefore[s.id])}
                     </Text>
                   )}
                   <RecapSetLine set={s} />
@@ -191,6 +214,96 @@ export function WorkoutRecap({
         ))}
       </ScrollView>
 
+      {/* Сохранить как шаблон — предложение, а не шаг: тренировка уже
+          записана целиком и без него. Поэтому оно живёт над панелью
+          выхода и только у тренировок, собранных с нуля: у начатой по
+          шаблону этот шаблон уже есть. */}
+      {!fromRoutine && sets.length > 0 && (
+        <View
+          style={{
+            paddingHorizontal: 12,
+            paddingTop: 10,
+            borderTopWidth: 1,
+            borderTopColor: '#00000015',
+            gap: 8,
+          }}
+        >
+          {savedRoutine ? (
+            <Text style={{ color: '#2c8746', fontWeight: '600' }}>
+              ✓ {t('Saved as a template')}
+            </Text>
+          ) : routineName === null ? (
+            <Pressable
+              onPress={() => setRoutineName(suggestedName)}
+              style={{
+                paddingVertical: 12,
+                alignItems: 'center',
+                backgroundColor: '#00000010',
+                borderRadius: 8,
+              }}
+            >
+              <Text style={{ fontWeight: '600' }}>{t('Save as a template')}</Text>
+            </Pressable>
+          ) : (
+            <>
+              <TextInput
+                autoFocus
+                placeholder={t('Name')}
+                value={routineName}
+                onChangeText={setRoutineName}
+                style={{
+                  borderWidth: 1,
+                  borderColor: '#00000020',
+                  borderRadius: 8,
+                  padding: 10,
+                  fontSize: 16,
+                }}
+              />
+              {!!saveError && <Text style={{ color: '#b23c3c' }}>{t(saveError)}</Text>}
+              <View style={{ flexDirection: 'row', gap: 8 }}>
+                <Pressable
+                  onPress={() => {
+                    setRoutineName(null);
+                    setSaveError('');
+                  }}
+                  style={{
+                    flex: 1,
+                    padding: 12,
+                    alignItems: 'center',
+                    backgroundColor: '#eee',
+                    borderRadius: 8,
+                  }}
+                >
+                  <Text>{t('Cancel')}</Text>
+                </Pressable>
+                <Pressable
+                  onPress={async () => {
+                    try {
+                      setSaveError('');
+                      const name = routineName.trim();
+                      if (!name) throw new Error('Name is required');
+                      await saveWorkoutAsRoutine(workoutId!, name);
+                      setSavedRoutine(true);
+                    } catch (e: any) {
+                      setSaveError(e.message);
+                    }
+                  }}
+                  style={{
+                    flex: 1,
+                    padding: 12,
+                    alignItems: 'center',
+                    backgroundColor: '#3aa655',
+                    borderRadius: 8,
+                  }}
+                >
+                  <Text style={{ color: '#fff', fontWeight: '600' }}>{t('Save')}</Text>
+                </Pressable>
+              </View>
+            </>
+          )}
+        </View>
+      )}
+
       {/* нижняя панель повторяет панель тренировки: слева общее время,
           справа действие — только вместо «Завершить» здесь выход */}
       <View
@@ -205,7 +318,7 @@ export function WorkoutRecap({
         }}
       >
         <Text style={{ flex: 1, fontSize: 16 }}>
-          {t('Total')}: {fmt(totalSeconds)}
+          {t('Total')}: {fmtMs(totalSeconds)}
         </Text>
         <Pressable
           onPress={onClose}
@@ -263,16 +376,19 @@ function RecapSetLine({ set }: { set: RecapSet }) {
         </Text>
       </View>
 
+      {/* Правый столбец — то, чем подход засчитан: время у секундомера,
+          RIR у повторов. Место то же, что на экране тренировки. */}
       <Text
+        numberOfLines={1}
         style={{
-          width: 56,
+          width: 78,
           textAlign: 'right',
-          fontSize: 15,
+          fontSize: 12,
           color: isPr ? PR_TEXT : '#2c8746',
           fontWeight: '600',
         }}
       >
-        {set.active_seconds > 0 ? fmt(set.active_seconds) : ''}
+        {set.active_seconds > 0 ? fmtMs(set.active_seconds) : (rirCompact(set, t) ?? '')}
       </Text>
     </View>
   );

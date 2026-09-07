@@ -10,7 +10,9 @@ import {
 } from '../db/library';
 import { SwipeRow } from '../components/SwipeRow';
 import { useT } from '../lib/i18n';
-import { fmt } from '../lib/time';
+import { rirBadge } from '../lib/rir';
+import { fmt, fmtMs } from '../lib/time';
+import { localizeWorkoutName } from '../lib/workoutName';
 
 function dateLabel(iso: string): string {
   const d = new Date(iso);
@@ -87,7 +89,8 @@ export default function History() {
                   onPress={() => (isOpen ? setOpenId(null) : expand(w.id))}
                 >
                   <Text style={{ fontSize: 17, fontWeight: '600' }}>
-                    {isOpen ? '▴' : '▾'} {w.routine_name}
+                    {isOpen ? '▴' : '▾'}{' '}
+                    {localizeWorkoutName(w.title, t) ?? t('Workout')}
                   </Text>
                   <Text style={{ color: '#666', fontSize: 13 }}>
                     {dateLabel(w.started_at)} · {fmt(w.total_seconds)} · {t('sets')}:{' '}
@@ -127,13 +130,18 @@ export default function History() {
   );
 }
 
-/** Как показать подход: 8 × 60 kg / 8 reps / 0:25 */
+/** Как показать подход: 8 × 60 kg · RIR 2 / 8 reps / 0:25 */
 function setLabel(s: HistorySet, t: (k: string) => string): string {
-  if (s.measurement_default === 'hold' && s.active_seconds > 0) return fmt(s.active_seconds);
-  if (s.reps != null && s.weight_kg != null) return `${s.reps} × ${s.weight_kg} ${t('kg')}`;
-  if (s.reps != null) return `${s.reps} ${t('reps')}`;
-  if (s.active_seconds > 0) return fmt(s.active_seconds);
-  return '—';
+  const badge = rirBadge(s, t);
+  // У подходов, записанных до перехода на RIR, его нет — там строка
+  // остаётся ровно такой же, какой была.
+  const suffix = badge === null ? '' : ` · ${badge}`;
+  if (s.measurement_default === 'hold' && s.active_seconds > 0) return fmtMs(s.active_seconds);
+  if (s.reps != null && s.weight_kg != null)
+    return `${s.reps} × ${s.weight_kg} ${t('kg')}${suffix}`;
+  if (s.reps != null) return `${s.reps} ${t('reps')}${suffix}`;
+  if (s.active_seconds > 0) return fmtMs(s.active_seconds);
+  return badge ?? '—';
 }
 
 function groupByExercise(sets: HistorySet[]) {

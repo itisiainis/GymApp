@@ -9,7 +9,17 @@ import type { SQLiteDatabase } from 'expo-sqlite';
  * приложением они выполнялись давно и повторно не запустятся.
  */
 
-const LATEST_VERSION = 8;
+const LATEST_VERSION = 12;
+
+/** Есть ли колонка в таблице — по фактической схеме, а не по номеру версии. */
+async function hasColumn(
+  db: SQLiteDatabase,
+  table: string,
+  column: string
+): Promise<boolean> {
+  const cols = await db.getAllAsync<{ name: string }>(`PRAGMA table_info(${table})`);
+  return cols.some((c) => c.name === column);
+}
 
 export async function migrate(db: SQLiteDatabase): Promise<void> {
   const row = await db.getFirstAsync<{ user_version: number }>('PRAGMA user_version');
@@ -121,7 +131,186 @@ export async function migrate(db: SQLiteDatabase): Promise<void> {
     version = 8;
   }
 
-  await db.execAsync(`PRAGMA user_version = ${LATEST_VERSION}`);
+  // Условие не только по номеру версии, но и по фактической схеме: база
+  // могла получить отметку «версия 9» без самой миграции, если LATEST_VERSION
+  // подняли раньше, чем дописали блок (строка ниже штампует версию, а
+  // приложение перезагружается на каждое сохранение файла). Проверка по
+  // колонке чинит такие базы вместо того, чтобы навсегда их пропускать.
+  if (version < 9 || !(await hasColumn(db, 'exercise_muscles', 'role'))) {
+    // Доля мышцы в упражнении заменяется ролью: главная или вторичная.
+    // Проценты не сходились с тем, как упражнение выбирают на практике,
+    // и требовали от пользователя раскладывать 100% руками.
+    //
+    // Колонку не удаляем, а пересобираем таблицу: вместе с share уходит
+    // и её CHECK, а менять ограничения ALTER TABLE в SQLite не умеет.
+    await db.execAsync(`
+      -- остаток от прошлой неудачной попытки, если она была
+      DROP TABLE IF EXISTS exercise_muscles_new;
+
+      CREATE TABLE exercise_muscles_new (
+          exercise_id INTEGER NOT NULL REFERENCES exercises(id) ON DELETE CASCADE,
+          muscle_id   INTEGER NOT NULL REFERENCES muscles(id)   ON DELETE CASCADE,
+          role        TEXT    NOT NULL DEFAULT 'secondary'
+              CHECK (role IN ('primary', 'secondary')),
+          PRIMARY KEY (exercise_id, muscle_id)
+      );
+
+      INSERT INTO exercise_muscles_new (exercise_id, muscle_id, role)
+      SELECT em.exercise_id, em.muscle_id,
+             CASE
+               WHEN em.share >= 0.3 THEN 'primary'
+               -- Ни одна доля не дотянула до порога (например, пять мышц
+               -- по 20% из кнопки «Поровну») — главной делаем наибольшую.
+               -- Иначе упражнение осталось бы совсем без главной мышцы, а
+               -- по ним потом считается имя тренировки.
+               --
+               -- Берём именно одну строку через ORDER BY + LIMIT, а не
+               -- сравнение с MAX(share): при равных долях под MAX подходят
+               -- сразу все, и главными становилось бы всё упражнение целиком.
+               WHEN em.muscle_id = (
+                        SELECT e2.muscle_id FROM exercise_muscles e2
+                        WHERE e2.exercise_id = em.exercise_id
+                        ORDER BY e2.share DESC, e2.muscle_id
+                        LIMIT 1
+                    )
+                    AND NOT EXISTS (
+                        SELECT 1 FROM exercise_muscles e3
+                        WHERE e3.exercise_id = em.exercise_id AND e3.share >= 0.3
+                    )
+                 THEN 'primary'
+               ELSE 'secondary'
+             END
+      FROM exercise_muscles em;
+
+      DROP TABLE exercise_muscles;
+      ALTER TABLE exercise_muscles_new RENAME TO exercise_muscles;
+    `);
+    version = 9;
+  }
+
+  // Проверка по колонке — по той же причине, что и в блоке выше.
+  if (version < 10 || !(await hasColumn(db, 'sets', 'rir'))) {
+    // Подход на повторы засчитывается не секундомером, а RIR — сколько
+    // повторов осталось в запасе.
+    //
+    // Две колонки, а не одна с числом-заглушкой: rir остаётся честным
+    // числом, которое можно усреднять, а «не дотянул» — отдельный факт.
+    // Смешать их в одной колонке (например, -1 = не дотянул) значило бы
+    // испортить любую агрегацию, а бэкап тут формат выгрузки для анализа,
+    // а не только резервная копия (см. db/backup.ts).
+    //
+    // Старым подходам RIR задним числом не проставляем: он не выводится
+    // из секунд, и придумывать его за пользователя нечестно. NULL при
+    // rir_missed = 0 и значит «не проставлен».
+    await db.execAsync(`
+      ALTER TABLE sets ADD COLUMN rir INTEGER
+          CHECK (rir IS NULL OR (rir >= 0 AND rir <= 5));
+      ALTER TABLE sets ADD COLUMN rir_missed INTEGER NOT NULL DEFAULT 0
+          CHECK (rir_missed IN (0, 1));
+    `);
+    version = 10;
+  }
+
+  if (version < 11 || !(await hasColumn(db, 'workouts', 'name'))) {
+    // Тренировка больше не обязана начинаться с шаблона: её собирают с
+    // нуля, а шаблон при желании сохраняют уже потом. Значит routine_id
+    // становится необязательным, а имя — своим полем: у тренировки с нуля
+    // шаблона нет, и брать название неоткуда (его собирают по главным
+    // мышцам входящих упражнений, см. db/workout-session.ts).
+    //
+    // Снять NOT NULL в SQLite можно только пересборкой таблицы, а у
+    // workouts есть дети (sets, set_intervals через них, workout_pauses,
+    // workout_exercise_notes, workout_exercise_order). Отсюда два условия:
+    //
+    // 1. Внешние ключи на время пересборки ВЫКЛЮЧАЕМ. При включённых
+    //    DROP TABLE workouts выполняет неявный DELETE и запускает
+    //    ON DELETE CASCADE у sets — то есть тихо стирает всю историю
+    //    подходов. PRAGMA внутри транзакции не действует, поэтому она
+    //    отдельным вызовом, до и после.
+    // 2. Имя новой таблице даём временное и переименовываем в конце:
+    //    дети ссылаются на «workouts» по имени, и к моменту переименования
+    //    старой таблицы с этим именем уже не существует.
+    await db.execAsync('PRAGMA foreign_keys = OFF');
+    try {
+      await db.execAsync(`
+        -- остаток от прошлой неудачной попытки, если она была
+        DROP TABLE IF EXISTS workouts_new;
+
+        CREATE TABLE workouts_new (
+            id         INTEGER PRIMARY KEY,
+            -- NULL = собрана с нуля, без шаблона
+            routine_id INTEGER REFERENCES routines(id),
+            -- NULL = показывать имя шаблона (тренировки, начатые по нему)
+            name       TEXT,
+            started_at TEXT NOT NULL,   -- ISO-8601 UTC
+            ended_at   TEXT             -- NULL = тренировка идёт
+        );
+
+        INSERT INTO workouts_new (id, routine_id, name, started_at, ended_at)
+        SELECT id, routine_id, NULL, started_at, ended_at FROM workouts;
+
+        DROP TABLE workouts;
+        ALTER TABLE workouts_new RENAME TO workouts;
+
+        CREATE INDEX idx_workouts_started ON workouts(started_at);
+      `);
+    } finally {
+      await db.execAsync('PRAGMA foreign_keys = ON');
+    }
+    version = 11;
+  }
+
+  if (version < 12 || !(await hasColumn(db, 'workouts', 'began_at'))) {
+    // 1. Тренировку сначала СОБИРАЮТ, и только потом запускают. Между
+    //    этими моментами она уже существует (упражнения куда-то надо
+    //    складывать), но время ещё не идёт. Отсюда разделение:
+    //      started_at — когда тренировку завели (черновик открыт),
+    //      began_at   — когда пошло время. NULL = ещё собирают.
+    //
+    //    began_at ставится СРАЗУ на пять секунд вперёд, когда нажали
+    //    «Let's start»: отсчёт перед стартом получается обычным временем
+    //    по стенным часам, а не таймером внутри приложения. Свёрнутое
+    //    приложение его больше не останавливает — просто вернувшись,
+    //    видишь то, что и должно быть.
+    //
+    // 2. Длительности считались целыми секундами (strftime('%s')), и
+    //    показанные значения не сходились при вычитании: между 0:07 и
+    //    0:12 на экране «пять секунд», а на деле от 4.01 до 5.99.
+    //    julianday() даёт дробные сутки, отсюда честные доли секунды.
+    //    Сами времена в базе всегда хранились с миллисекундами
+    //    (ISO-8601 из Date.toISOString), так что точность появляется и у
+    //    всего, что уже записано, — пересчитывать ничего не нужно.
+    await db.execAsync(`
+      ALTER TABLE workouts ADD COLUMN began_at TEXT;
+      -- всё, что записано раньше, стартовало сразу: черновиков не было
+      UPDATE workouts SET began_at = started_at;
+
+      DROP VIEW IF EXISTS set_times;
+      CREATE VIEW set_times AS
+      SELECT
+          s.id AS set_id,
+          MIN(i.started_at) AS started_at,
+          MAX(i.ended_at)   AS ended_at,
+          COALESCE(SUM(
+              CASE WHEN i.ended_at IS NOT NULL
+                   THEN MAX(0.0, (julianday(i.ended_at) - julianday(i.started_at)) * 86400.0)
+                   ELSE 0 END
+          ), 0) AS active_seconds,
+          MAX(CASE WHEN i.id IS NOT NULL AND i.ended_at IS NULL THEN 1 ELSE 0 END)
+              AS is_running
+      FROM sets s
+      LEFT JOIN set_intervals i ON i.set_id = s.id
+      GROUP BY s.id;
+    `);
+    version = 12;
+  }
+
+  // Штампуем версию, до которой реально догнали, а не LATEST_VERSION.
+  // Разница видна ровно в одном, зато неприятном случае: LATEST_VERSION уже
+  // подняли, а блок под него ещё не дописан (или дописан в другом файле и
+  // не сохранён). Со старой безусловной записью база в этот момент получала
+  // отметку о миграции, которой не было, и блок пропускался уже навсегда.
+  await db.execAsync(`PRAGMA user_version = ${version}`);
 }
 
 const V1 = `

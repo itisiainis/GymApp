@@ -93,10 +93,10 @@ export default function Settings() {
         </View>
 
         <Text style={{ fontWeight: '600', marginTop: 16 }}>
-          {t('Advanced rep recording')}
+          {t('Recording rep sets')}
         </Text>
         <Text style={{ color: '#888', fontSize: 13 }}>
-          {t('Advanced rep recording hint')}
+          {t('Recording rep sets hint')}
         </Text>
 
         <Pressable
@@ -122,7 +122,7 @@ export default function Settings() {
           >
             {rec.advancedReps && <Text style={{ color: '#fff', fontSize: 14 }}>✓</Text>}
           </View>
-          <Text style={{ fontSize: 15 }}>{t('Time every set')}</Text>
+          <Text style={{ fontSize: 15 }}>{t('Record sets with a stopwatch')}</Text>
         </Pressable>
 
         {rec.advancedReps && (

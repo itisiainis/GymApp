@@ -1,4 +1,6 @@
+import { RIR_MISSED, type RirValue } from '../lib/rir';
 import { getDb, now } from './index';
+import type { MuscleRole } from './library';
 import { getRecordingSettings } from './settings';
 
 function shifted(seconds: number): string {
@@ -25,6 +27,10 @@ export interface SetRow {
   exercise_id: number;
   reps: number | null;
   weight_kg: number | null;
+  /** Повторов в запасе, 0–5. NULL при rir_missed = 0 — не проставлен. */
+  rir: number | null;
+  /** 1 — «не дотянул»: честного числа у подхода нет. */
+  rir_missed: number;
   started_at: string | null;
   ended_at: string | null;
   active_seconds: number;
@@ -33,8 +39,25 @@ export interface SetRow {
 
 export interface ActiveWorkout {
   id: number;
-  routine_id: number;
+  /** NULL — тренировку собрали с нуля, без шаблона. */
+  routine_id: number | null;
+  /** Имя тренировки: своё или, если она по шаблону, имя шаблона. */
+  title: string | null;
+  /** Когда тренировку завели — то есть открыли черновик. */
   started_at: string;
+  /**
+   * Когда пошло время. NULL — тренировку ещё собирают.
+   *
+   * Может быть в БУДУЩЕМ: «Let's start» ставит его на пять секунд вперёд,
+   * и эти пять секунд — обычный отсчёт по стенным часам. Поэтому всё
+   * время на экране считается из него, а не из таймера в приложении:
+   * свёрнутое приложение ничего не останавливает.
+   */
+  began_at: string | null;
+  /** Секунды уже закрытых пауз. */
+  paused_seconds: number;
+  /** Начало открытой паузы. NULL — тренировка не на паузе. */
+  paused_since: string | null;
   is_paused: number;
 }
 
@@ -44,25 +67,97 @@ export interface ActiveWorkout {
 
 export async function getActiveWorkout(): Promise<ActiveWorkout | null> {
   const db = await getDb();
+  // LEFT JOIN, а не JOIN: у тренировки с нуля шаблона нет, и обычное
+  // соединение просто не вернуло бы её.
+  //
+  // Пауза отдаётся не одним флагом, а разложенной на слагаемые
+  // (накоплено + идёт с такого-то момента): по ним экран тикает сам, без
+  // запроса к базе на каждый кадр. С миллисекундами это уже принципиально
+  // — иначе на каждый показанный знак приходился бы поход в базу.
   return db.getFirstAsync<ActiveWorkout>(`
-    SELECT w.id, w.routine_id, w.started_at,
+    SELECT w.id, w.routine_id, w.started_at, w.began_at,
+           COALESCE(w.name, r.name) AS title,
+           COALESCE((
+             SELECT SUM(MAX(0.0,
+               (julianday(p.ended_at) - julianday(p.started_at)) * 86400.0))
+             FROM workout_pauses p
+             WHERE p.workout_id = w.id AND p.ended_at IS NOT NULL
+           ), 0) AS paused_seconds,
+           (SELECT p.started_at FROM workout_pauses p
+            WHERE p.workout_id = w.id AND p.ended_at IS NULL
+            LIMIT 1) AS paused_since,
            EXISTS (SELECT 1 FROM workout_pauses p
                    WHERE p.workout_id = w.id AND p.ended_at IS NULL) AS is_paused
     FROM workouts w
+    LEFT JOIN routines r ON r.id = w.routine_id
     WHERE w.ended_at IS NULL
     ORDER BY w.started_at DESC
     LIMIT 1
   `);
 }
 
-export async function startWorkout(routineId: number): Promise<number> {
+/**
+ * Запустить время тренировки — с задержкой на отсчёт перед стартом.
+ *
+ * began_at сразу ставится в БУДУЩЕЕ, а не по истечении отсчёта: тогда
+ * отсчёт живёт в базе как обычное время, а не как таймер в приложении.
+ * Экран показывает его отрицательным, и свернуть приложение на эти пять
+ * секунд можно без последствий — именно на это и жаловались.
+ *
+ * Повторное нажатие ничего не сдвигает: WHERE began_at IS NULL.
+ */
+export async function startWorkoutClock(
+  workoutId: number,
+  delaySeconds: number
+): Promise<void> {
+  const db = await getDb();
+  await db.runAsync('UPDATE workouts SET began_at = ? WHERE id = ? AND began_at IS NULL', [
+    shifted(delaySeconds),
+    workoutId,
+  ]);
+}
+
+/**
+ * Отменить запуск, пока идёт отсчёт: время ещё не пошло, и тренировка
+ * возвращается в состояние «собираем состав».
+ *
+ * Условие began_at > now важно: у уже начавшейся тренировки отменять
+ * нечего, и подходы в ней трогать нельзя.
+ */
+export async function cancelWorkoutClock(workoutId: number): Promise<void> {
+  const db = await getDb();
+  await db.runAsync('UPDATE workouts SET began_at = NULL WHERE id = ? AND began_at > ?', [
+    workoutId,
+    now(),
+  ]);
+}
+
+/**
+ * Выбросить черновик целиком — «Go back» до старта.
+ *
+ * Только пока время не пошло: у начатой тренировки для этого есть Finish,
+ * и молча стирать записанные подходы нельзя.
+ */
+export async function discardWorkout(workoutId: number): Promise<void> {
+  const db = await getDb();
+  await db.runAsync('DELETE FROM workouts WHERE id = ? AND began_at IS NULL', [workoutId]);
+}
+
+/**
+ * Начать тренировку. routineId = null — с нуля, без шаблона: это обычный
+ * случай, шаблон стал необязательным.
+ */
+export async function startWorkout(
+  routineId: number | null,
+  name: string | null = null
+): Promise<number> {
   const active = await getActiveWorkout();
   if (active) throw new Error('A workout is already in progress');
 
   const db = await getDb();
   const res = await db.runAsync(
-    'INSERT INTO workouts (routine_id, started_at) VALUES (?, ?)',
-    [routineId, now()]
+    'INSERT INTO workouts (routine_id, name, started_at) VALUES (?, ?, ?)',
+    [routineId, name, now()]
   );
   return res.lastInsertRowId;
 }
@@ -107,15 +202,20 @@ export async function resumeWorkout(workoutId: number): Promise<void> {
   );
 }
 
-/** Общее время тренировки за вычетом пауз, в секундах. */
+/**
+ * Общее время тренировки за вычетом пауз, в секундах с долями.
+ *
+ * Считается от began_at, а не от started_at: сборка тренировки временем
+ * тренировки не является. У черновика (began_at IS NULL) времени нет.
+ */
 export async function getWorkoutTotalSeconds(workoutId: number): Promise<number> {
   const db = await getDb();
-  const row = await db.getFirstAsync<{ total: number }>(
+  const row = await db.getFirstAsync<{ total: number | null }>(
     `
     SELECT
-      (strftime('%s', COALESCE(w.ended_at, ?)) - strftime('%s', w.started_at))
+      (julianday(COALESCE(w.ended_at, ?)) - julianday(w.began_at)) * 86400.0
       - COALESCE((
-          SELECT SUM(strftime('%s', COALESCE(p.ended_at, ?)) - strftime('%s', p.started_at))
+          SELECT SUM((julianday(COALESCE(p.ended_at, ?)) - julianday(p.started_at)) * 86400.0)
           FROM workout_pauses p WHERE p.workout_id = w.id
         ), 0) AS total
     FROM workouts w WHERE w.id = ?
@@ -223,32 +323,80 @@ export async function startSet(setId: number): Promise<void> {
  *
  * Момент времени всё равно сохраняется, поэтому порядок подходов и
  * отдых между ними считаются как раньше — теряется только длительность.
+ *
+ * Зовётся уже изнутри чужой транзакции, поэтому своей не открывает.
  */
-export async function recordSet(setId: number): Promise<void> {
+async function stampRecorded(
+  db: Awaited<ReturnType<typeof getDb>>,
+  setId: number,
+  workoutId: number,
+  ts: string
+): Promise<void> {
+  // отметка снимает паузу: раз подход записан, тренировка снова идёт
+  await db.runAsync(
+    'UPDATE workout_pauses SET ended_at = ? WHERE workout_id = ? AND ended_at IS NULL',
+    [ts, workoutId]
+  );
+  await db.runAsync(
+    'INSERT INTO set_intervals (set_id, started_at, ended_at) VALUES (?, ?, ?)',
+    [setId, ts, ts]
+  );
+}
+
+/**
+ * Проставить RIR — то, чем засчитывается подход на повторы вместо
+ * секундомера. null снимает отметку целиком.
+ *
+ * Вместе со значением записывается и МОМЕНТ выполнения: подход без времени
+ * — это заготовка, а по временам считаются и порядок подходов, и отдых
+ * между ними (lib/time.ts). То есть выбор значения на барабане делает ровно
+ * то же, что раньше делал одиночный тап по кнопке записи, плюс сохраняет
+ * само значение — отдельный recordSet после этого не нужен.
+ *
+ * Момент ставится один раз. Поправленный через минуту RIR не должен
+ * сдвигать подход во времени: иначе отдых перед следующим подходом
+ * пересчитался бы задним числом, хотя отдыхали ровно столько же.
+ */
+export async function setSetRir(setId: number, value: RirValue | null): Promise<void> {
   const db = await getDb();
-  const ts = now();
-  const ctx = await db.getFirstAsync<{ workout_id: number }>(
-    'SELECT workout_id FROM sets WHERE id = ?',
+  const ctx = await db.getFirstAsync<{ workout_id: number; recorded: number }>(
+    `SELECT s.workout_id,
+            EXISTS (SELECT 1 FROM set_intervals i WHERE i.set_id = s.id) AS recorded
+     FROM sets s WHERE s.id = ?`,
     [setId]
   );
   if (!ctx) throw new Error('Set not found');
 
+  const ts = now();
   await db.withTransactionAsync(async () => {
-    await db.runAsync(
-      'UPDATE workout_pauses SET ended_at = ? WHERE workout_id = ? AND ended_at IS NULL',
-      [ts, ctx.workout_id]
-    );
-    await db.runAsync(
-      'INSERT INTO set_intervals (set_id, started_at, ended_at) VALUES (?, ?, ?)',
-      [setId, ts, ts]
-    );
+    if (value === null) {
+      await db.runAsync('UPDATE sets SET rir = NULL, rir_missed = 0 WHERE id = ?', [setId]);
+      await db.runAsync('DELETE FROM set_intervals WHERE set_id = ?', [setId]);
+      return;
+    }
+
+    await db.runAsync('UPDATE sets SET rir = ?, rir_missed = ? WHERE id = ?', [
+      value === RIR_MISSED ? null : value,
+      value === RIR_MISSED ? 1 : 0,
+      setId,
+    ]);
+    if (!ctx.recorded) await stampRecorded(db, setId, ctx.workout_id, ts);
   });
 }
 
-/** Отменить отметку — убирает все интервалы подхода. */
+/**
+ * Отменить отметку — убирает и время подхода, и проставленный RIR.
+ *
+ * Одно без другого не бывает: подход с RIR, но без времени, выпал бы из
+ * расчёта отдыха, а подход со временем, но без RIR, не дал бы завершить
+ * тренировку — незаписанные для кнопки Finish считаются именно по RIR.
+ */
 export async function unrecordSet(setId: number): Promise<void> {
   const db = await getDb();
-  await db.runAsync('DELETE FROM set_intervals WHERE set_id = ?', [setId]);
+  await db.withTransactionAsync(async () => {
+    await db.runAsync('DELETE FROM set_intervals WHERE set_id = ?', [setId]);
+    await db.runAsync('UPDATE sets SET rir = NULL, rir_missed = 0 WHERE id = ?', [setId]);
+  });
 }
 
 /**
@@ -394,79 +542,128 @@ export async function setExerciseNote(
 }
 
 /* ------------------------------------------------------------------ */
-/* Заготовка тренировки по шаблону                                     */
+/* Заготовка: что подставить в подходы упражнения                      */
 /* ------------------------------------------------------------------ */
 
 export interface PrefillRow {
   exercise_id: number;
   name: string;
   measurement_default: MeasurementType;
+  /** Порядок упражнения в будущей тренировке. */
   position: number;
   reps: number | null;
   weight_kg: number | null;
+  /** Длительность — для холдов; у подходов на повторы 0. */
+  active_seconds: number;
+  /** Когда это было. NULL — упражнение ещё ни разу не делали. */
+  workout_started: string | null;
 }
 
-export async function getRoutinePrefill(routineId: number): Promise<PrefillRow[]> {
+/**
+ * Заготовка по списку упражнений: подходы из последнего исполнения
+ * КАЖДОГО упражнения — в какой бы тренировке оно ни делалось.
+ *
+ * Раньше значения брались из прошлой тренировки по тому же шаблону. С тех
+ * пор шаблон перестал быть обязательным: то же упражнение могло делаться
+ * вчера в тренировке, собранной с нуля, и подставлять надо именно те веса,
+ * а не полугодовой давности «по шаблону». Заодно это работает и когда
+ * шаблона нет вовсе — упражнение добавили руками посреди тренировки.
+ *
+ * Порядок и position — по переданному списку: он и задаёт раскладку.
+ */
+export async function getExercisePrefill(exerciseIds: number[]): Promise<PrefillRow[]> {
+  if (exerciseIds.length === 0) return [];
+
   const db = await getDb();
-  const last = await db.getFirstAsync<{ id: number }>(
-    `SELECT id FROM workouts
-     WHERE routine_id = ? AND ended_at IS NOT NULL
-     ORDER BY started_at DESC LIMIT 1`,
-    [routineId]
+  const holes = exerciseIds.map(() => '?').join(', ');
+
+  const meta = await db.getAllAsync<{
+    exercise_id: number;
+    name: string;
+    measurement_default: MeasurementType;
+  }>(
+    `SELECT id AS exercise_id, name, measurement_default
+     FROM exercises WHERE id IN (${holes})`,
+    exerciseIds
   );
 
-  // Состав шаблона: то, с чего тренировка начинается в самый первый раз,
-  // и запасной вариант для упражнений, которых в прошлый раз не делали.
-  const template = await db.getAllAsync<PrefillRow>(
-    `SELECT e.id AS exercise_id, e.name, e.measurement_default, re.position,
-            NULL AS reps, NULL AS weight_kg
+  const previous = await db.getAllAsync<{
+    exercise_id: number;
+    reps: number | null;
+    weight_kg: number | null;
+    active_seconds: number;
+    workout_started: string;
+  }>(
+    `
+    SELECT s.exercise_id, s.reps, s.weight_kg, t.active_seconds,
+           w.started_at AS workout_started
+    FROM sets s
+    JOIN workouts w  ON w.id = s.workout_id
+    JOIN set_times t ON t.set_id = s.id
+    WHERE s.exercise_id IN (${holes})
+      AND w.id = (
+            SELECT w2.id FROM workouts w2
+            JOIN sets s2 ON s2.workout_id = w2.id
+            WHERE s2.exercise_id = s.exercise_id AND w2.ended_at IS NOT NULL
+            ORDER BY w2.started_at DESC LIMIT 1
+          )
+    ORDER BY s.position, s.id
+    `,
+    exerciseIds
+  );
+
+  const byExercise = new Map<number, typeof previous>();
+  for (const row of previous) {
+    const arr = byExercise.get(row.exercise_id);
+    if (arr) arr.push(row);
+    else byExercise.set(row.exercise_id, [row]);
+  }
+
+  const out: PrefillRow[] = [];
+  exerciseIds.forEach((exerciseId, position) => {
+    const info = meta.find((m) => m.exercise_id === exerciseId);
+    if (!info) return;
+    const done = byExercise.get(exerciseId);
+
+    // Упражнение ещё ни разу не делали — одна пустая строка: подход в
+    // тренировке всё равно нужен, просто подставить в него нечего.
+    if (!done || done.length === 0) {
+      out.push({
+        ...info,
+        position,
+        reps: null,
+        weight_kg: null,
+        active_seconds: 0,
+        workout_started: null,
+      });
+      return;
+    }
+    for (const s of done) {
+      out.push({
+        ...info,
+        position,
+        reps: s.reps,
+        weight_kg: s.weight_kg,
+        active_seconds: s.active_seconds,
+        workout_started: s.workout_started,
+      });
+    }
+  });
+  return out;
+}
+
+/** Заготовка по шаблону: его состав плюс подстановка по каждому упражнению. */
+export async function getRoutinePrefill(routineId: number): Promise<PrefillRow[]> {
+  const db = await getDb();
+  const ids = await db.getAllAsync<{ exercise_id: number }>(
+    `SELECT re.exercise_id
      FROM routine_exercises re
      JOIN exercises e ON e.id = re.exercise_id
      WHERE re.routine_id = ? AND e.is_archived = 0
      ORDER BY re.position`,
     [routineId]
   );
-
-  if (!last) return template;
-
-  /*
-   * Заготовка повторяет ПРОШЛУЮ ТРЕНИРОВКУ, а не состав шаблона.
-   *
-   * Раньше она строилась от routine_exercises, и всё, чего в шаблоне нет,
-   * до следующего раза не доживало: упражнение, добавленное по ходу
-   * тренировки, попадает только в workout_exercise_order, а в шаблон — нет.
-   * Вместе с ним пропадали и его подходы с повторами и весами — ровно то,
-   * ради чего заготовка и нужна. Прошлая тренировка знает и добавленные
-   * упражнения, и порядок, и число подходов, поэтому отталкиваемся от неё.
-   */
-  const previous = await db.getAllAsync<PrefillRow>(
-    `
-    SELECT e.id AS exercise_id, e.name, e.measurement_default,
-           COALESCE(o.position, 999999) AS position,
-           s.reps, s.weight_kg
-    FROM sets s
-    JOIN exercises e ON e.id = s.exercise_id
-    LEFT JOIN workout_exercise_order o
-           ON o.workout_id = s.workout_id AND o.exercise_id = s.exercise_id
-    WHERE s.workout_id = ? AND e.is_archived = 0
-    ORDER BY COALESCE(o.position, 999999), s.exercise_id, s.position, s.id
-    `,
-    [last.id]
-  );
-
-  // Упражнение могли дописать в шаблон уже после прошлой тренировки — тогда
-  // его там нет, и оно идёт в конец пустой строкой.
-  const seen = new Set(previous.map((r) => r.exercise_id));
-  const rows = [...previous, ...template.filter((r) => !seen.has(r.exercise_id))];
-
-  // position пришёл из двух разных источников (порядок прошлой тренировки и
-  // порядок шаблона), и числа в них не связаны между собой. Нумеруем заново,
-  // иначе beginWorkout разложит упражнения по случайно совпавшим значениям.
-  const order = new Map<number, number>();
-  for (const r of rows) {
-    if (!order.has(r.exercise_id)) order.set(r.exercise_id, order.size);
-  }
-  return rows.map((r) => ({ ...r, position: order.get(r.exercise_id)! }));
+  return getExercisePrefill(ids.map((r) => r.exercise_id));
 }
 
 /* ------------------------------------------------------------------ */
@@ -538,15 +735,8 @@ export async function createExercise(input: {
   name: string;
   description?: string;
   measurementDefault: MeasurementType;
-  muscles: { muscleId: number; share: number }[];
+  muscles: { muscleId: number; role: MuscleRole }[];
 }): Promise<number> {
-  const total = input.muscles.reduce((s, m) => s + m.share, 0);
-  if (Math.abs(total - 1) > 0.001) {
-    throw new Error(
-      `Muscle shares must add up to 100%, currently ${Math.round(total * 100)}%`
-    );
-  }
-
   const db = await getDb();
   let id = 0;
   await db.withTransactionAsync(async () => {
@@ -558,8 +748,8 @@ export async function createExercise(input: {
     id = res.lastInsertRowId;
     for (const m of input.muscles) {
       await db.runAsync(
-        'INSERT INTO exercise_muscles (exercise_id, muscle_id, share) VALUES (?, ?, ?)',
-        [id, m.muscleId, m.share]
+        'INSERT INTO exercise_muscles (exercise_id, muscle_id, role) VALUES (?, ?, ?)',
+        [id, m.muscleId, m.role]
       );
     }
   });

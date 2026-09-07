@@ -2,16 +2,21 @@ import { useEffect, useState } from 'react';
 import { ScrollView, Text, View } from 'react-native';
 import { getWorkoutDetail, type HistorySet, type WorkoutSummary } from '../db/library';
 import { useT } from '../lib/i18n';
-import { fmt } from '../lib/time';
+import { rirBadge } from '../lib/rir';
+import { fmt, fmtMs } from '../lib/time';
+import { localizeWorkoutName } from '../lib/workoutName';
 import { SheetModal } from './SheetModal';
 
-/** Как показать подход: 8 × 60 kg / 8 reps / 0:25 */
+/** Как показать подход: 8 × 60 kg · RIR 2 / 8 reps / 0:25 */
 function setLabel(s: HistorySet, t: (k: string) => string): string {
-  if (s.measurement_default === 'hold' && s.active_seconds > 0) return fmt(s.active_seconds);
-  if (s.reps != null && s.weight_kg != null) return `${s.reps} × ${s.weight_kg} ${t('kg')}`;
-  if (s.reps != null) return `${s.reps} ${t('reps')}`;
-  if (s.active_seconds > 0) return fmt(s.active_seconds);
-  return '—';
+  const badge = rirBadge(s, t);
+  const suffix = badge === null ? '' : ` · ${badge}`;
+  if (s.measurement_default === 'hold' && s.active_seconds > 0) return fmtMs(s.active_seconds);
+  if (s.reps != null && s.weight_kg != null)
+    return `${s.reps} × ${s.weight_kg} ${t('kg')}${suffix}`;
+  if (s.reps != null) return `${s.reps} ${t('reps')}${suffix}`;
+  if (s.active_seconds > 0) return fmtMs(s.active_seconds);
+  return badge ?? '—';
 }
 
 function groupByExercise(sets: HistorySet[]) {
@@ -47,7 +52,13 @@ export function WorkoutDetail({
   }, [workout]);
 
   return (
-    <SheetModal visible={workout !== null} onClose={onClose} title={workout?.routine_name}>
+    <SheetModal
+      visible={workout !== null}
+      onClose={onClose}
+      title={
+        workout ? (localizeWorkoutName(workout.title, t) ?? t('Workout')) : undefined
+      }
+    >
       <ScrollView style={{ flex: 1 }} contentContainerStyle={{ padding: 16, paddingBottom: 40 }}>
         {workout && (
           <Text style={{ color: '#666', fontSize: 13, marginBottom: 12 }}>

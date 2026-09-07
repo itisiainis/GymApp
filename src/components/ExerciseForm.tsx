@@ -6,6 +6,7 @@ import {
   listMuscles,
   updateExercise,
   type Muscle,
+  type MuscleRole,
 } from '../db/library';
 import { createExercise, type MeasurementType } from '../db/queries';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
@@ -18,8 +19,8 @@ import { SheetModal } from './SheetModal';
  * exerciseId === число → правим существующее
  *
  * Мышцы задаются в два шага: сначала выбираем какие участвуют
- * (отдельный список с галочками), потом раскидываем проценты
- * по короткому списку выбранных.
+ * (отдельный список с галочками), потом по короткому списку выбранных
+ * помечаем, какие из них главные, а какие вторичные.
  */
 export function ExerciseForm({
   visible,
@@ -38,7 +39,9 @@ export function ExerciseForm({
   const [measurement, setMeasurement] = useState<MeasurementType>('reps');
   const [allMuscles, setAllMuscles] = useState<Muscle[]>([]);
   const [chosen, setChosen] = useState<number[]>([]);
-  const [shares, setShares] = useState<Record<number, string>>({});
+  // Роль выбранной мышцы. Новая мышца по умолчанию вторичная: главных
+  // обычно одна-две, отмечать их явно — короче, чем снимать лишние.
+  const [roles, setRoles] = useState<Record<number, MuscleRole>>({});
   const [selectOpen, setSelectOpen] = useState(false);
   const [error, setError] = useState('');
 
@@ -54,7 +57,7 @@ export function ExerciseForm({
       setDescription('');
       setMeasurement('reps');
       setChosen([]);
-      setShares({});
+      setRoles({});
       return;
     }
 
@@ -67,9 +70,9 @@ export function ExerciseForm({
       }
       const ms = await getExerciseMuscles(exerciseId);
       setChosen(ms.map((m) => m.muscle_id));
-      const next: Record<number, string> = {};
-      ms.forEach((m) => (next[m.muscle_id] = String(Math.round(m.share * 100))));
-      setShares(next);
+      const next: Record<number, MuscleRole> = {};
+      ms.forEach((m) => (next[m.muscle_id] = m.role));
+      setRoles(next);
     })();
   }, [visible, exerciseId]);
 
@@ -79,28 +82,19 @@ export function ExerciseForm({
     return map;
   }, [allMuscles]);
 
-  const total = chosen.reduce((s, id) => s + (parseFloat(shares[id] ?? '') || 0), 0);
-
-  /** Поровну между выбранными — обычно быстрее, чем вбивать руками. */
-  const spreadEvenly = () => {
-    if (chosen.length === 0) return;
-    const base = Math.floor(100 / chosen.length);
-    const next: Record<number, string> = { ...shares };
-    chosen.forEach((id, i) => {
-      next[id] = String(i === 0 ? 100 - base * (chosen.length - 1) : base);
-    });
-    setShares(next);
-  };
-
   const save = async () => {
     try {
       setError('');
-      const picked = chosen
-        .map((id) => ({ muscleId: id, share: (parseFloat(shares[id] ?? '') || 0) / 100 }))
-        .filter((m) => m.share > 0);
+      const picked = chosen.map((id) => ({
+        muscleId: id,
+        role: roles[id] ?? ('secondary' as MuscleRole),
+      }));
 
       if (!name.trim()) throw new Error('Name is required');
-      if (picked.length === 0) throw new Error('Pick muscles and set percentages');
+      if (picked.length === 0) throw new Error('Pick at least one muscle');
+      if (!picked.some((m) => m.role === 'primary')) {
+        throw new Error('Mark at least one muscle as primary');
+      }
 
       const payload = {
         name: name.trim(),
@@ -187,37 +181,20 @@ export function ExerciseForm({
             </Pressable>
           </View>
 
-          {/* ---- Шаг 2: проценты только по выбранным ---- */}
+          {/* ---- Шаг 2: роль каждой выбранной мышцы ---- */}
 
           {chosen.length === 0 ? (
             <Text style={{ color: '#999' }}>{t('No muscle selected yet')}</Text>
           ) : (
             <>
-              <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10 }}>
-                <Text
-                  style={{
-                    flex: 1,
-                    color: Math.abs(total - 100) < 0.5 ? '#3aa655' : '#b23c3c',
-                    fontWeight: '600',
-                  }}
-                >
-                  {Math.round(total)}% / 100%
-                </Text>
-                <Pressable
-                  onPress={spreadEvenly}
-                  style={{
-                    paddingVertical: 6,
-                    paddingHorizontal: 10,
-                    backgroundColor: '#00000010',
-                    borderRadius: 6,
-                  }}
-                >
-                  <Text style={{ fontSize: 13 }}>{t('Split evenly')}</Text>
-                </Pressable>
-              </View>
+              <Text style={{ fontSize: 12, color: '#999' }}>
+                {t('Tap a muscle to switch between primary and secondary')}
+              </Text>
 
               {chosen.map((id) => {
                 const m = byId.get(id);
+                const role = roles[id] ?? 'secondary';
+                const primary = role === 'primary';
                 return (
                   <View
                     key={id}
@@ -227,18 +204,39 @@ export function ExerciseForm({
                       <Text>{t(m?.name ?? String(id))}</Text>
                       <Text style={{ fontSize: 11, color: '#999' }}>{t(m?.body_group ?? '')}</Text>
                     </View>
-                    <TextInput
-                      keyboardType="numeric"
-                      placeholder="0"
-                      value={shares[id] ?? ''}
-                      onChangeText={(v) => setShares((s) => ({ ...s, [id]: v }))}
-                      style={{ ...field, width: 70, textAlign: 'right' }}
-                    />
+
+                    <Pressable
+                      onPress={() =>
+                        setRoles((r) => ({
+                          ...r,
+                          [id]: primary ? 'secondary' : 'primary',
+                        }))
+                      }
+                      style={{
+                        paddingVertical: 8,
+                        paddingHorizontal: 12,
+                        borderRadius: 8,
+                        borderWidth: 1,
+                        borderColor: primary ? '#3aa655' : '#00000025',
+                        backgroundColor: primary ? '#3aa655' : 'transparent',
+                      }}
+                    >
+                      <Text
+                        style={{
+                          fontSize: 13,
+                          fontWeight: '600',
+                          color: primary ? '#fff' : '#666',
+                        }}
+                      >
+                        {primary ? t('Primary') : t('Secondary')}
+                      </Text>
+                    </Pressable>
+
                     <Pressable
                       onPress={() => {
                         setChosen((c) => c.filter((x) => x !== id));
-                        setShares((s) => {
-                          const next = { ...s };
+                        setRoles((r) => {
+                          const next = { ...r };
                           delete next[id];
                           return next;
                         });
@@ -292,9 +290,10 @@ export function ExerciseForm({
         onClose={() => setSelectOpen(false)}
         onApply={(ids) => {
           setChosen(ids);
-          setShares((s) => {
-            const next: Record<number, string> = {};
-            ids.forEach((id) => (next[id] = s[id] ?? ''));
+          // роли уже отмеченных мышц сохраняем, снятые забываем
+          setRoles((r) => {
+            const next: Record<number, MuscleRole> = {};
+            ids.forEach((id) => (next[id] = r[id] ?? 'secondary'));
             return next;
           });
           setSelectOpen(false);

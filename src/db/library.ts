@@ -2,6 +2,13 @@ import { getDb } from './index';
 
 /* ---------------- Мышцы ---------------- */
 
+/**
+ * Роль мышцы в упражнении. Пришло на смену доле-проценту: раскладывать
+ * 100% руками было мучительно, а на практике важно только, ведущая мышца
+ * или помогающая.
+ */
+export type MuscleRole = 'primary' | 'secondary';
+
 export interface Muscle {
   id: number;
   name: string;
@@ -26,14 +33,9 @@ export async function updateExercise(
     name: string;
     description?: string;
     measurementDefault: 'reps' | 'hold';
-    muscles: { muscleId: number; share: number }[];
+    muscles: { muscleId: number; role: MuscleRole }[];
   }
 ): Promise<void> {
-  const total = input.muscles.reduce((s, m) => s + m.share, 0);
-  if (Math.abs(total - 1) > 0.001) {
-    throw new Error(`Muscle shares must add up to 100%, currently ${Math.round(total * 100)}%`);
-  }
-
   const db = await getDb();
   const row = await db.getFirstAsync<{ is_custom: number }>(
     'SELECT is_custom FROM exercises WHERE id = ?',
@@ -51,8 +53,8 @@ export async function updateExercise(
     await db.runAsync('DELETE FROM exercise_muscles WHERE exercise_id = ?', [exerciseId]);
     for (const m of input.muscles) {
       await db.runAsync(
-        'INSERT INTO exercise_muscles (exercise_id, muscle_id, share) VALUES (?, ?, ?)',
-        [exerciseId, m.muscleId, m.share]
+        'INSERT INTO exercise_muscles (exercise_id, muscle_id, role) VALUES (?, ?, ?)',
+        [exerciseId, m.muscleId, m.role]
       );
     }
   });
@@ -74,17 +76,19 @@ export async function getExercise(exerciseId: number): Promise<ExerciseFull | nu
 export interface ExerciseMuscle {
   muscle_id: number;
   name: string;
-  share: number;
+  role: MuscleRole;
 }
 
 export async function getExerciseMuscles(exerciseId: number): Promise<ExerciseMuscle[]> {
   const db = await getDb();
   return db.getAllAsync<ExerciseMuscle>(
-    `SELECT em.muscle_id, m.name, em.share
+    // главные впереди: 'primary' < 'secondary' по алфавиту, так что
+    // обычной сортировки по role достаточно
+    `SELECT em.muscle_id, m.name, em.role
      FROM exercise_muscles em
      JOIN muscles m ON m.id = em.muscle_id
      WHERE em.exercise_id = ?
-     ORDER BY em.share DESC`,
+     ORDER BY em.role, m.name`,
     [exerciseId]
   );
 }
@@ -193,24 +197,38 @@ export async function renameRoutine(routineId: number, name: string): Promise<vo
 }
 
 /**
- * Шаблон нельзя удалить, если по нему есть тренировки:
- * workouts.routine_id NOT NULL, история осталась бы без ссылки.
+ * Удалить шаблон.
+ *
+ * Раньше это запрещалось, если по шаблону есть тренировки: routine_id был
+ * NOT NULL, и история осталась бы без ссылки. Теперь шаблон — вторичная
+ * вещь, и держать его вечно из-за одной старой тренировки незачем: перед
+ * удалением проставляем этим тренировкам имя шаблона своим полем, а ссылку
+ * обнуляем. История сохраняет и название, и подходы — теряется только
+ * связь с планом, которого больше нет.
  */
 export async function deleteRoutine(routineId: number): Promise<void> {
   const db = await getDb();
-  const row = await db.getFirstAsync<{ n: number }>(
-    'SELECT COUNT(*) AS n FROM workouts WHERE routine_id = ?',
-    [routineId]
-  );
-  if ((row?.n ?? 0) > 0) throw new Error('This workout already has recorded sessions');
-  await db.runAsync('DELETE FROM routines WHERE id = ?', [routineId]);
+  await db.withTransactionAsync(async () => {
+    await db.runAsync(
+      `UPDATE workouts
+       SET name = COALESCE(name, (SELECT r.name FROM routines r WHERE r.id = ?)),
+           routine_id = NULL
+       WHERE routine_id = ?`,
+      [routineId, routineId]
+    );
+    await db.runAsync('DELETE FROM routines WHERE id = ?', [routineId]);
+  });
 }
 
 /* ---------------- История тренировок ---------------- */
 
 export interface WorkoutSummary {
   id: number;
-  routine_name: string;
+  /**
+   * Имя тренировки: своё (собранной с нуля — по главным мышцам) или имя
+   * шаблона. NULL бывает у пустой тренировки, которую нечем назвать.
+   */
+  title: string | null;
   started_at: string;
   ended_at: string | null;
   total_seconds: number;
@@ -222,9 +240,13 @@ export async function listWorkouts(limit = 50): Promise<WorkoutSummary[]> {
   const db = await getDb();
   return db.getAllAsync<WorkoutSummary>(
     `
-    SELECT w.id, r.name AS routine_name, w.started_at, w.ended_at,
-           (strftime('%s', w.ended_at) - strftime('%s', w.started_at))
-             - COALESCE((SELECT SUM(strftime('%s', p.ended_at) - strftime('%s', p.started_at))
+    -- Время тренировки идёт от began_at: сборка состава, которая была до
+    -- него, тренировкой не считается. started_at остаётся у черновиков,
+    -- но их в истории нет — здесь только завершённые.
+    SELECT w.id, COALESCE(w.name, r.name) AS title,
+           COALESCE(w.began_at, w.started_at) AS started_at, w.ended_at,
+           (julianday(w.ended_at) - julianday(COALESCE(w.began_at, w.started_at))) * 86400.0
+             - COALESCE((SELECT SUM((julianday(p.ended_at) - julianday(p.started_at)) * 86400.0)
                          FROM workout_pauses p
                          WHERE p.workout_id = w.id AND p.ended_at IS NOT NULL), 0)
              AS total_seconds,
@@ -235,7 +257,9 @@ export async function listWorkouts(limit = 50): Promise<WorkoutSummary[]> {
               WHERE s.workout_id = w.id
            )) AS exercises
     FROM workouts w
-    JOIN routines r ON r.id = w.routine_id
+    -- LEFT JOIN: тренировка с нуля шаблона не имеет, и обычное соединение
+    -- просто выкинуло бы её из истории
+    LEFT JOIN routines r ON r.id = w.routine_id
     WHERE w.ended_at IS NOT NULL
     ORDER BY w.started_at DESC
     LIMIT ?
@@ -251,6 +275,9 @@ export interface HistorySet {
   measurement_default: 'reps' | 'hold';
   reps: number | null;
   weight_kg: number | null;
+  /** У подходов, записанных до перехода на RIR, его нет и не будет. */
+  rir: number | null;
+  rir_missed: number;
   active_seconds: number;
   started_at: string | null;
 }
@@ -260,7 +287,7 @@ export async function getWorkoutDetail(workoutId: number): Promise<HistorySet[]>
   return db.getAllAsync<HistorySet>(
     `
     SELECT s.id, s.exercise_id, e.name AS exercise_name, e.measurement_default,
-           s.reps, s.weight_kg, t.active_seconds, t.started_at
+           s.reps, s.weight_kg, s.rir, s.rir_missed, t.active_seconds, t.started_at
     FROM sets s
     JOIN exercises e ON e.id = s.exercise_id
     JOIN set_times t ON t.set_id = s.id
@@ -275,7 +302,7 @@ export async function getWorkoutDetail(workoutId: number): Promise<HistorySet[]>
 export async function getWorkoutDates(): Promise<string[]> {
   const db = await getDb();
   const rows = await db.getAllAsync<{ started_at: string }>(
-    'SELECT started_at FROM workouts WHERE ended_at IS NOT NULL'
+    'SELECT COALESCE(began_at, started_at) AS started_at FROM workouts WHERE ended_at IS NOT NULL'
   );
   return rows.map((r) => r.started_at);
 }
@@ -317,6 +344,24 @@ export async function getRoutine(
 
 /* ---------------- Итоги тренировки ---------------- */
 
+/** Шапка тренировки: чем её назвать и была ли она по шаблону. */
+export interface WorkoutMeta {
+  id: number;
+  routine_id: number | null;
+  title: string | null;
+}
+
+export async function getWorkoutMeta(workoutId: number): Promise<WorkoutMeta | null> {
+  const db = await getDb();
+  return db.getFirstAsync<WorkoutMeta>(
+    `SELECT w.id, w.routine_id, COALESCE(w.name, r.name) AS title
+     FROM workouts w
+     LEFT JOIN routines r ON r.id = w.routine_id
+     WHERE w.id = ?`,
+    [workoutId]
+  );
+}
+
 export interface RecapSet {
   /** id подхода: разбор повторяет раскладку тренировки, и отдых там тоже
    *  привязан к подходу, а не к его номеру в списке. */
@@ -326,6 +371,8 @@ export interface RecapSet {
   measurement_default: 'reps' | 'hold';
   reps: number | null;
   weight_kg: number | null;
+  rir: number | null;
+  rir_missed: number;
   active_seconds: number;
   started_at: string | null;
   ended_at: string | null;
@@ -357,7 +404,8 @@ export async function getWorkoutRecap(workoutId: number): Promise<RecapSet[]> {
       GROUP BY s.exercise_id
     )
     SELECT s.id, s.exercise_id, e.name AS exercise_name, e.measurement_default,
-           s.reps, s.weight_kg, t.active_seconds, t.started_at, t.ended_at,
+           s.reps, s.weight_kg, s.rir, s.rir_missed,
+           t.active_seconds, t.started_at, t.ended_at,
            CASE
              WHEN e.measurement_default = 'hold'
                THEN CASE WHEN t.active_seconds > COALESCE(p.best_seconds, 0) THEN 1 ELSE 0 END

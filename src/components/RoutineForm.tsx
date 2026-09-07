@@ -25,6 +25,10 @@ interface Item {
  *
  * Состав держим в локальном состоянии и записываем разом при сохранении —
  * тогда «Отмена» действительно отменяет, а не оставляет полусобранный шаблон.
+ *
+ * Это не единственный способ завести шаблон и уже не главный: чаще его
+ * сохраняют из готовой тренировки в разборе (saveWorkoutAsRoutine).
+ * Здесь — когда состав известен заранее и хочется расписать его руками.
  */
 export function RoutineForm({
   visible,
@@ -94,7 +98,7 @@ export function RoutineForm({
       >
         <View style={{ padding: 16, paddingTop: 48, gap: 12 }}>
           <Text style={{ fontSize: 22, fontWeight: '700' }}>
-            {isEdit ? t('Edit workout') : t('New workout')}
+            {isEdit ? t('Edit template') : t('New template')}
           </Text>
 
           <TextInput

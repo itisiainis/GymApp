@@ -5,6 +5,7 @@ import { WorkoutDetail } from '../components/WorkoutDetail';
 import { getWorkoutDates, listWorkouts, type WorkoutSummary } from '../db/library';
 import { useT } from '../lib/i18n';
 import { fmt } from '../lib/time';
+import { localizeWorkoutName } from '../lib/workoutName';
 
 const DAYS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
 const MONTHS = [
@@ -190,7 +191,9 @@ export default function Calendar() {
               }}
             >
               <View style={{ flexDirection: 'row' }}>
-                <Text style={{ flex: 1, fontWeight: '600' }}>{w.routine_name}</Text>
+                <Text style={{ flex: 1, fontWeight: '600' }}>
+                  {localizeWorkoutName(w.title, t) ?? t('Workout')}
+                </Text>
                 <Text style={{ color: '#666', fontSize: 13 }}>
                   {new Date(w.started_at).toLocaleDateString()}
                 </Text>

@@ -40,6 +40,17 @@ export const RECAP_HEADER_TEXT = '#ffffff';
 export const RECAP_SET_BG = '#f2f6f9';
 export const RECAP_FIELD_BG = '#ffffff';
 
+/**
+ * Барабан RIR. Выбранное значение — тем же зелёным, что и записанный
+ * подход: это и есть отметка о выполнении, просто с числом внутри.
+ */
+export const RIR_ACTIVE = '#2c8746';
+export const RIR_ACTIVE_TEXT = '#ffffff';
+export const RIR_IDLE_BG = '#00000008';
+export const RIR_IDLE_TEXT = '#6b7278';
+/** Слот «не проставлен»: выбран, но это не ответ, а его отсутствие. */
+export const RIR_NONE = '#c2c8cc';
+
 /** Личный рекорд. */
 export const PR_BG = '#fbf1d3';
 export const PR_TEXT = '#a3790f';

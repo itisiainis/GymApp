@@ -93,10 +93,21 @@ export async function importBackup(json: string): Promise<ImportResult> {
     }
 
     for (const name of TABLES) {
-      const data = parsed.tables[name];
+      let data = parsed.tables[name];
       if (!Array.isArray(data) || data.length === 0) {
         if (!Array.isArray(data)) skippedTables.push(name);
         continue;
+      }
+
+      // Бэкап, снятый до перехода на роли мышц, несёт долю share, а такой
+      // колонки уже нет — INSERT по колонкам из файла упал бы. Переводим
+      // тем же порогом, что и миграция схемы.
+      if (name === 'exercise_muscles' && data.length > 0 && 'share' in data[0]) {
+        data = data.map((row: any) => ({
+          exercise_id: row.exercise_id,
+          muscle_id: row.muscle_id,
+          role: row.share >= 0.3 ? 'primary' : 'secondary',
+        }));
       }
 
       // колонки берём из файла: если схема с тех пор обросла новыми
