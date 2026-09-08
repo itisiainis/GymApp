@@ -1,7 +1,8 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { FlatList, Pressable, Text, TextInput, View } from 'react-native';
 import { searchExercises, type Exercise } from '../db/queries';
 import { useT } from '../lib/i18n';
+import { matchesQuery } from '../lib/tags';
 import { SheetModal } from './SheetModal';
 import { ExerciseForm } from './ExerciseForm';
 
@@ -31,8 +32,14 @@ export function ExercisePicker({
 
   useEffect(() => {
     if (!visible) return;
-    searchExercises(query).then(setItems);
-  }, [visible, query]);
+    searchExercises().then(setItems);
+  }, [visible]);
+
+  // По названию и по тегам (мышцы, снаряд) — см. lib/tags.ts
+  const found = useMemo(
+    () => items.filter((e) => matchesQuery(e, query, t)),
+    [items, query, t]
+  );
 
   useEffect(() => {
     if (visible) setChosen([]);
@@ -119,7 +126,7 @@ export function ExercisePicker({
 
         <FlatList
           style={{ flex: 1, paddingHorizontal: 16 }}
-          data={items}
+          data={found}
           keyExtractor={(i) => String(i.id)}
           ItemSeparatorComponent={() => (
             <View style={{ height: 1, backgroundColor: '#eee' }} />
@@ -176,7 +183,7 @@ export function ExercisePicker({
           setFormOpen(false);
           // созданное упражнение сразу отмечено, но список не закрываем
           setChosen((c) => (c.includes(id) ? c : [...c, id]));
-          searchExercises(query).then(setItems);
+          searchExercises().then(setItems);
         }}
       />
     </SheetModal>

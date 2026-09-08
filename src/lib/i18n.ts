@@ -62,8 +62,6 @@ const RU: Record<string, string> = {
   Pause: 'Пауза',
   Resume: 'Продолжить',
   Finish: 'Завершить',
-  Rest: 'Отдых',
-  rest: 'отдых',
   Recap: 'Разбор',
   'Workout done': 'Тренировка завершена',
   'New personal records': 'Новых рекордов',
@@ -78,7 +76,6 @@ const RU: Record<string, string> = {
 
   // RIR
   RIR: 'RIR',
-  "Didn't reach": 'не дотянул',
 
   // старт тренировки
   'Or copy a previous workout': 'Или повторить прошлую тренировку',
@@ -107,6 +104,22 @@ const RU: Record<string, string> = {
   Reps: 'Повторы',
   Time: 'Время',
   Muscles: 'Мышцы',
+  Equipment: 'Снаряжение',
+  'Not set': 'Не задано',
+  'Enter the weight of one, the app doubles it':
+    'Вписывай вес одной — приложение удвоит его само.',
+  'Bodyweight counts as load; add plates on top':
+    'Вес тела считается нагрузкой. Довесок (блин, жилет) вписывай в килограммы.',
+
+  // снаряжение
+  Barbell: 'Штанга',
+  'Dumbbells (pair)': 'Гантели (пара)',
+  'Dumbbell (single)': 'Гантель (одна)',
+  Kettlebell: 'Гиря',
+  Machine: 'Тренажёр',
+  Cable: 'Блок',
+  Band: 'Резина',
+  Bodyweight: 'Своё тело',
   Select: 'Выбрать',
   'Which muscles are involved': 'Какие мышцы участвуют',
   'Which muscles are involved in': 'Какие мышцы участвуют в',
@@ -145,7 +158,8 @@ const RU: Record<string, string> = {
   'Recording rep sets hint':
     'По умолчанию подход на повторы засчитывается через RIR — сколько повторов осталось в запасе. Секундомер можно включить вместо него. Упражнения на время меряются таймером всегда.',
   'Record sets with a stopwatch': 'Записывать подходы секундомером',
-  'Trim hint': 'Секунды, которые не считаются рабочими: дойти до снаряда и вернуться к телефону.',
+  Trimming: 'Срезка времени',
+  'Trim hint': 'Секунды, которые не считаются рабочими: дойти до снаряда и вернуться к телефону. Действует и для упражнений на время.',
   'Trim at start': 'Срезать в начале, сек',
   'Trim at end': 'Срезать в конце, сек',
   Backup: 'Резервная копия',

@@ -1,4 +1,4 @@
-import { RIR_MISSED, type RirValue } from '../lib/rir';
+import type { RirValue } from '../lib/rir';
 import { getDb, now } from './index';
 import type { MuscleRole } from './library';
 import { getRecordingSettings } from './settings';
@@ -19,6 +19,14 @@ export interface Exercise {
   description: string | null;
   measurement_default: MeasurementType;
   is_custom: number;
+  equipment_id: number | null;
+  /**
+   * Теги для поиска: мышцы упражнения плюс снаряд, каноническими
+   * (английскими) названиями через запятую. Отдаются вместе с
+   * упражнением, чтобы искать по ним можно было и на другом языке —
+   * перевод известен только интерфейсу (см. lib/tags.ts).
+   */
+  tags: string | null;
 }
 
 export interface SetRow {
@@ -27,10 +35,8 @@ export interface SetRow {
   exercise_id: number;
   reps: number | null;
   weight_kg: number | null;
-  /** Повторов в запасе, 0–5. NULL при rir_missed = 0 — не проставлен. */
+  /** Повторов в запасе: 0–5, 6 = «>5». NULL — не проставлен. */
   rir: number | null;
-  /** 1 — «не дотянул»: честного числа у подхода нет. */
-  rir_missed: number;
   started_at: string | null;
   ended_at: string | null;
   active_seconds: number;
@@ -370,16 +376,12 @@ export async function setSetRir(setId: number, value: RirValue | null): Promise<
   const ts = now();
   await db.withTransactionAsync(async () => {
     if (value === null) {
-      await db.runAsync('UPDATE sets SET rir = NULL, rir_missed = 0 WHERE id = ?', [setId]);
+      await db.runAsync('UPDATE sets SET rir = NULL WHERE id = ?', [setId]);
       await db.runAsync('DELETE FROM set_intervals WHERE set_id = ?', [setId]);
       return;
     }
 
-    await db.runAsync('UPDATE sets SET rir = ?, rir_missed = ? WHERE id = ?', [
-      value === RIR_MISSED ? null : value,
-      value === RIR_MISSED ? 1 : 0,
-      setId,
-    ]);
+    await db.runAsync('UPDATE sets SET rir = ? WHERE id = ?', [value, setId]);
     if (!ctx.recorded) await stampRecorded(db, setId, ctx.workout_id, ts);
   });
 }
@@ -395,7 +397,7 @@ export async function unrecordSet(setId: number): Promise<void> {
   const db = await getDb();
   await db.withTransactionAsync(async () => {
     await db.runAsync('DELETE FROM set_intervals WHERE set_id = ?', [setId]);
-    await db.runAsync('UPDATE sets SET rir = NULL, rir_missed = 0 WHERE id = ?', [setId]);
+    await db.runAsync('UPDATE sets SET rir = NULL WHERE id = ?', [setId]);
   });
 }
 
@@ -406,6 +408,10 @@ export async function unrecordSet(setId: number): Promise<void> {
  * Срезаем prepSeconds/reachSeconds так же, как при старте/стопе таймером -
  * иначе один и тот же подход считался бы по-разному в зависимости от
  * способа записи, а этого быть не должно.
+ *
+ * Доли секунды не округляем: после срезки остаток и так почти никогда не
+ * целый, а показываются времена с сотыми — округлив здесь, мы бы
+ * записали не то, что потом покажем.
  */
 export async function recordSetSeconds(setId: number, seconds: number): Promise<void> {
   const db = await getDb();
@@ -721,13 +727,30 @@ export async function getLatestBodyweight(): Promise<number | null> {
 /* Справочник упражнений                                               */
 /* ------------------------------------------------------------------ */
 
-export async function searchExercises(query = ''): Promise<Exercise[]> {
+/**
+ * Все упражнения вместе с тегами — поиск идёт поверх этого списка в
+ * интерфейсе (lib/tags.ts), а не в SQL.
+ *
+ * Так искать можно и по-русски: названия мышц и снарядов лежат в базе
+ * по-английски, а переводит их только интерфейс. LIKE по базе нашёл бы
+ * «Chest», но не «грудь». Список личный и небольшой, поэтому фильтровать
+ * его в памяти дешевле, чем ходить в базу на каждую букву.
+ */
+export async function searchExercises(): Promise<Exercise[]> {
   const db = await getDb();
   return db.getAllAsync<Exercise>(
-    `SELECT * FROM exercises
-     WHERE name LIKE ? AND is_archived = 0
-     ORDER BY is_custom DESC, name`,
-    [`%${query}%`]
+    `SELECT e.*,
+            (SELECT GROUP_CONCAT(tag, ', ') FROM (
+               SELECT m.name AS tag
+               FROM exercise_muscles em
+               JOIN muscles m ON m.id = em.muscle_id
+               WHERE em.exercise_id = e.id
+               UNION
+               SELECT q.name FROM equipment q WHERE q.id = e.equipment_id
+             )) AS tags
+     FROM exercises e
+     WHERE e.is_archived = 0
+     ORDER BY e.is_custom DESC, e.name`
   );
 }
 
@@ -735,15 +758,21 @@ export async function createExercise(input: {
   name: string;
   description?: string;
   measurementDefault: MeasurementType;
+  equipmentId?: number | null;
   muscles: { muscleId: number; role: MuscleRole }[];
 }): Promise<number> {
   const db = await getDb();
   let id = 0;
   await db.withTransactionAsync(async () => {
     const res = await db.runAsync(
-      `INSERT INTO exercises (name, description, measurement_default, is_custom)
-       VALUES (?, ?, ?, 1)`,
-      [input.name, input.description ?? null, input.measurementDefault]
+      `INSERT INTO exercises (name, description, measurement_default, equipment_id, is_custom)
+       VALUES (?, ?, ?, ?, 1)`,
+      [
+        input.name,
+        input.description ?? null,
+        input.measurementDefault,
+        input.equipmentId ?? null,
+      ]
     );
     id = res.lastInsertRowId;
     for (const m of input.muscles) {

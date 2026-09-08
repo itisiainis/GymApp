@@ -3,8 +3,10 @@ import { Pressable, ScrollView, Text, TextInput, View } from 'react-native';
 import {
   getExercise,
   getExerciseMuscles,
+  listEquipment,
   listMuscles,
   updateExercise,
+  type Equipment,
   type Muscle,
   type MuscleRole,
 } from '../db/library';
@@ -38,6 +40,9 @@ export function ExerciseForm({
   const [description, setDescription] = useState('');
   const [measurement, setMeasurement] = useState<MeasurementType>('reps');
   const [allMuscles, setAllMuscles] = useState<Muscle[]>([]);
+  const [allEquipment, setAllEquipment] = useState<Equipment[]>([]);
+  /** Снаряд — один: он же задаёт арифметику веса, и двух правил сразу не бывает. */
+  const [equipmentId, setEquipmentId] = useState<number | null>(null);
   const [chosen, setChosen] = useState<number[]>([]);
   // Роль выбранной мышцы. Новая мышца по умолчанию вторичная: главных
   // обычно одна-две, отмечать их явно — короче, чем снимать лишние.
@@ -51,11 +56,13 @@ export function ExerciseForm({
     if (!visible) return;
     setError('');
     listMuscles().then(setAllMuscles);
+    listEquipment().then(setAllEquipment);
 
     if (exerciseId === null) {
       setName('');
       setDescription('');
       setMeasurement('reps');
+      setEquipmentId(null);
       setChosen([]);
       setRoles({});
       return;
@@ -67,6 +74,7 @@ export function ExerciseForm({
         setName(ex.name);
         setDescription(ex.description ?? '');
         setMeasurement(ex.measurement_default);
+        setEquipmentId(ex.equipment_id);
       }
       const ms = await getExerciseMuscles(exerciseId);
       setChosen(ms.map((m) => m.muscle_id));
@@ -100,6 +108,7 @@ export function ExerciseForm({
         name: name.trim(),
         description: description.trim() || undefined,
         measurementDefault: measurement,
+        equipmentId,
         muscles: picked,
       };
 
@@ -154,6 +163,54 @@ export function ExerciseForm({
               </Pressable>
             ))}
           </View>
+
+          {/* ---- Снаряжение ---- */}
+
+          {/* Снаряд — и тег для поиска («бицепс штанга»), и правило веса:
+              у пары гантелей в подходе пишут вес одной, а поднято вдвое
+              больше; упражнения со своим весом добавляют вес тела. */}
+          <Text style={{ fontWeight: '600', marginTop: 8 }}>{t('Equipment')}</Text>
+          <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 8 }}>
+            {[null, ...allEquipment].map((eq) => {
+              const id = eq?.id ?? null;
+              const on = equipmentId === id;
+              return (
+                <Pressable
+                  key={id ?? 'none'}
+                  onPress={() => setEquipmentId(id)}
+                  style={{
+                    paddingVertical: 8,
+                    paddingHorizontal: 12,
+                    borderRadius: 999,
+                    backgroundColor: on ? '#4aa3df' : '#00000010',
+                  }}
+                >
+                  <Text style={{ color: on ? '#fff' : '#333', fontSize: 13 }}>
+                    {eq ? t(eq.name) : t('Not set')}
+                  </Text>
+                </Pressable>
+              );
+            })}
+          </View>
+          {(() => {
+            const eq = allEquipment.find((x) => x.id === equipmentId);
+            if (!eq) return null;
+            if (eq.weight_factor !== 1) {
+              return (
+                <Text style={{ color: '#888', fontSize: 12 }}>
+                  {t('Enter the weight of one, the app doubles it')}
+                </Text>
+              );
+            }
+            if (eq.adds_bodyweight === 1) {
+              return (
+                <Text style={{ color: '#888', fontSize: 12 }}>
+                  {t('Bodyweight counts as load; add plates on top')}
+                </Text>
+              );
+            }
+            return null;
+          })()}
 
           {/* ---- Шаг 1: какие мышцы участвуют ---- */}
 

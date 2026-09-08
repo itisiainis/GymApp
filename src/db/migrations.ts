@@ -9,7 +9,7 @@ import type { SQLiteDatabase } from 'expo-sqlite';
  * приложением они выполнялись давно и повторно не запустятся.
  */
 
-const LATEST_VERSION = 12;
+const LATEST_VERSION = 14;
 
 /** Есть ли колонка в таблице — по фактической схеме, а не по номеру версии. */
 async function hasColumn(
@@ -136,7 +136,9 @@ export async function migrate(db: SQLiteDatabase): Promise<void> {
   // подняли раньше, чем дописали блок (строка ниже штампует версию, а
   // приложение перезагружается на каждое сохранение файла). Проверка по
   // колонке чинит такие базы вместо того, чтобы навсегда их пропускать.
-  if (version < 9 || !(await hasColumn(db, 'exercise_muscles', 'role'))) {
+  const hasShare = await hasColumn(db, 'exercise_muscles', 'share');
+  if (version < 9 || hasShare) {
+   if (hasShare) {
     // Доля мышцы в упражнении заменяется ролью: главная или вторичная.
     // Проценты не сходились с тем, как упражнение выбирают на практике,
     // и требовали от пользователя раскладывать 100% руками.
@@ -185,11 +187,13 @@ export async function migrate(db: SQLiteDatabase): Promise<void> {
       DROP TABLE exercise_muscles;
       ALTER TABLE exercise_muscles_new RENAME TO exercise_muscles;
     `);
+   }
     version = 9;
   }
 
   // Проверка по колонке — по той же причине, что и в блоке выше.
-  if (version < 10 || !(await hasColumn(db, 'sets', 'rir'))) {
+  const hasRirColumn = await hasColumn(db, 'sets', 'rir');
+  if (version < 10 || !hasRirColumn) {
     // Подход на повторы засчитывается не секундомером, а RIR — сколько
     // повторов осталось в запасе.
     //
@@ -202,16 +206,23 @@ export async function migrate(db: SQLiteDatabase): Promise<void> {
     // Старым подходам RIR задним числом не проставляем: он не выводится
     // из секунд, и придумывать его за пользователя нечестно. NULL при
     // rir_missed = 0 и значит «не проставлен».
-    await db.execAsync(`
-      ALTER TABLE sets ADD COLUMN rir INTEGER
-          CHECK (rir IS NULL OR (rir >= 0 AND rir <= 5));
-      ALTER TABLE sets ADD COLUMN rir_missed INTEGER NOT NULL DEFAULT 0
-          CHECK (rir_missed IN (0, 1));
-    `);
+    if (!hasRirColumn) {
+      await db.execAsync(`
+        ALTER TABLE sets ADD COLUMN rir INTEGER
+            CHECK (rir IS NULL OR (rir >= 0 AND rir <= 5));
+      `);
+    }
+    if (!(await hasColumn(db, 'sets', 'rir_missed'))) {
+      await db.execAsync(`
+        ALTER TABLE sets ADD COLUMN rir_missed INTEGER NOT NULL DEFAULT 0
+            CHECK (rir_missed IN (0, 1));
+      `);
+    }
     version = 10;
   }
 
-  if (version < 11 || !(await hasColumn(db, 'workouts', 'name'))) {
+  const needsWorkoutRebuild = !(await hasColumn(db, 'workouts', 'name'));
+  if (version < 11 || needsWorkoutRebuild) {
     // Тренировка больше не обязана начинаться с шаблона: её собирают с
     // нуля, а шаблон при желании сохраняют уже потом. Значит routine_id
     // становится необязательным, а имя — своим полем: у тренировки с нуля
@@ -230,9 +241,10 @@ export async function migrate(db: SQLiteDatabase): Promise<void> {
     // 2. Имя новой таблице даём временное и переименовываем в конце:
     //    дети ссылаются на «workouts» по имени, и к моменту переименования
     //    старой таблицы с этим именем уже не существует.
-    await db.execAsync('PRAGMA foreign_keys = OFF');
-    try {
-      await db.execAsync(`
+    if (needsWorkoutRebuild) {
+      await db.execAsync('PRAGMA foreign_keys = OFF');
+      try {
+        await db.execAsync(`
         -- остаток от прошлой неудачной попытки, если она была
         DROP TABLE IF EXISTS workouts_new;
 
@@ -253,14 +265,16 @@ export async function migrate(db: SQLiteDatabase): Promise<void> {
         ALTER TABLE workouts_new RENAME TO workouts;
 
         CREATE INDEX idx_workouts_started ON workouts(started_at);
-      `);
-    } finally {
-      await db.execAsync('PRAGMA foreign_keys = ON');
+        `);
+      } finally {
+        await db.execAsync('PRAGMA foreign_keys = ON');
+      }
     }
     version = 11;
   }
 
-  if (version < 12 || !(await hasColumn(db, 'workouts', 'began_at'))) {
+  const hasBeganAt = await hasColumn(db, 'workouts', 'began_at');
+  if (version < 12 || !hasBeganAt) {
     // 1. Тренировку сначала СОБИРАЮТ, и только потом запускают. Между
     //    этими моментами она уже существует (упражнения куда-то надо
     //    складывать), но время ещё не идёт. Отсюда разделение:
@@ -280,11 +294,20 @@ export async function migrate(db: SQLiteDatabase): Promise<void> {
     //    Сами времена в базе всегда хранились с миллисекундами
     //    (ISO-8601 из Date.toISOString), так что точность появляется и у
     //    всего, что уже записано, — пересчитывать ничего не нужно.
+    //
+    // Колонку добавляем, только если её ещё нет: сюда можно попасть и с
+    // уже добавленной (версия отштамповалась ниже, чем есть на самом
+    // деле), а повторный ALTER — это ошибка, которая остановит всю
+    // миграцию. Пересоздание представления ниже повторный прогон
+    // переживает само.
+    if (!hasBeganAt) {
+      await db.execAsync(`
+        ALTER TABLE workouts ADD COLUMN began_at TEXT;
+        -- всё, что записано раньше, стартовало сразу: черновиков не было
+        UPDATE workouts SET began_at = started_at;
+      `);
+    }
     await db.execAsync(`
-      ALTER TABLE workouts ADD COLUMN began_at TEXT;
-      -- всё, что записано раньше, стартовало сразу: черновиков не было
-      UPDATE workouts SET began_at = started_at;
-
       DROP VIEW IF EXISTS set_times;
       CREATE VIEW set_times AS
       SELECT
@@ -303,6 +326,132 @@ export async function migrate(db: SQLiteDatabase): Promise<void> {
       GROUP BY s.id;
     `);
     version = 12;
+  }
+
+  // Условие наоборот: мигрировать надо, пока колонка ЕЩЁ есть. И сама
+  // пересборка — тоже под этим условием: досюда можно дойти с уже
+  // перестроенной таблицей (версия отштамповалась ниже, чем есть), и
+  // тогда копировать из несуществующей колонки было бы ошибкой, которая
+  // остановит миграцию.
+  const hasLegacyRir = await hasColumn(db, 'sets', 'rir_missed');
+  if (version < 13 || hasLegacyRir) {
+    // Шкала RIR стала «>5, 5, 4, 3, 2, 1, 0»: сколько повторов осталось в
+    // запасе, до нуля. Отдельного «не дотянул» больше нет — на шкале для
+    // него нет места, а нулевой запас это уже и есть край.
+    //
+    // «>5» хранится числом 6: это не отдельная категория, а тот же счёт,
+    // просто с открытым верхом (шесть и больше). Для анализа это цензура
+    // сверху, а не пропуск, и в выгрузке (db/backup.ts) колонка остаётся
+    // обычным числом, которое можно усреднять.
+    //
+    // Ни расширить CHECK, ни убрать колонку rir_missed в SQLite нельзя
+    // без пересборки таблицы, поэтому пересобираем — по тому же рецепту,
+    // что и workouts в версии 11:
+    //   1. внешние ключи выключены: у set_intervals стоит ON DELETE
+    //      CASCADE, и DROP TABLE при включённых стёр бы все интервалы;
+    //   2. представление set_times снимается заранее. ALTER TABLE RENAME
+    //      перечитывает схему целиком и спотыкается о представление,
+    //      которое ссылается на уже удалённую таблицу.
+    if (hasLegacyRir) {
+      await db.execAsync('PRAGMA foreign_keys = OFF');
+      try {
+        await db.execAsync(`
+        -- остаток от прошлой неудачной попытки, если она была
+        DROP TABLE IF EXISTS sets_new;
+        DROP VIEW IF EXISTS set_times;
+
+        CREATE TABLE sets_new (
+            id          INTEGER PRIMARY KEY,
+            workout_id  INTEGER NOT NULL REFERENCES workouts(id)  ON DELETE CASCADE,
+            exercise_id INTEGER NOT NULL REFERENCES exercises(id),
+            reps        INTEGER,
+            weight_kg   REAL,
+            position    INTEGER NOT NULL DEFAULT 0,
+            -- NULL = не проставлен, 0..5 = запас, 6 = «>5»
+            rir         INTEGER CHECK (rir IS NULL OR (rir >= 0 AND rir <= 6))
+        );
+
+        INSERT INTO sets_new (id, workout_id, exercise_id, reps, weight_kg, position, rir)
+        SELECT id, workout_id, exercise_id, reps, weight_kg, position,
+               -- «не дотянул» ближе всего к нулевому запасу: сил не осталось
+               CASE WHEN rir_missed = 1 THEN 0 ELSE rir END
+        FROM sets;
+
+        DROP TABLE sets;
+        ALTER TABLE sets_new RENAME TO sets;
+
+        CREATE INDEX idx_sets_workout  ON sets(workout_id);
+        CREATE INDEX idx_sets_exercise ON sets(exercise_id);
+        CREATE INDEX idx_sets_position ON sets(workout_id, exercise_id, position);
+
+        CREATE VIEW set_times AS
+        SELECT
+            s.id AS set_id,
+            MIN(i.started_at) AS started_at,
+            MAX(i.ended_at)   AS ended_at,
+            COALESCE(SUM(
+                CASE WHEN i.ended_at IS NOT NULL
+                     THEN MAX(0.0, (julianday(i.ended_at) - julianday(i.started_at)) * 86400.0)
+                     ELSE 0 END
+            ), 0) AS active_seconds,
+            MAX(CASE WHEN i.id IS NOT NULL AND i.ended_at IS NULL THEN 1 ELSE 0 END)
+                AS is_running
+        FROM sets s
+        LEFT JOIN set_intervals i ON i.set_id = s.id
+        GROUP BY s.id;
+        `);
+      } finally {
+        await db.execAsync('PRAGMA foreign_keys = ON');
+      }
+    }
+    version = 13;
+  }
+
+  const hasEquipment = await hasColumn(db, 'exercises', 'equipment_id');
+  if (version < 14 || !hasEquipment) {
+    // Снаряжение — вторая половина тегов упражнения (первая, мышцы, уже
+    // есть): «бицепс + штанга» ищется по любому из слов.
+    //
+    // Кроме поиска у снаряжения есть смысл в арифметике веса, и он
+    // хранится прямо здесь, а не зашит в код по названиям:
+    //   weight_factor   — на что умножить введённый вес. У пары гантелей
+    //                     это 2: в подходе пишут вес ОДНОЙ, потому что
+    //                     именно он написан на самой гантеле;
+    //   adds_bodyweight — прибавлять ли вес тела. Подтягивания с блином
+    //                     нагружают телом плюс блином, и вес тела берётся
+    //                     из его же истории (таблица bodyweight).
+    //
+    // Пара и одна гантель — разные строки, а не флаг: на практике это
+    // просто разные снаряды, и выбирать «гантель + галочку пара» дольше,
+    // чем выбрать нужное из списка.
+    await db.execAsync(`
+      CREATE TABLE IF NOT EXISTS equipment (
+          id              INTEGER PRIMARY KEY,
+          name            TEXT NOT NULL UNIQUE,
+          weight_factor   REAL    NOT NULL DEFAULT 1,
+          adds_bodyweight INTEGER NOT NULL DEFAULT 0
+              CHECK (adds_bodyweight IN (0, 1))
+      );
+
+      INSERT OR IGNORE INTO equipment (id, name, weight_factor, adds_bodyweight) VALUES
+          (1, 'Barbell',            1, 0),
+          (2, 'Dumbbells (pair)',   2, 0),
+          (3, 'Dumbbell (single)',  1, 0),
+          (4, 'Kettlebell',         1, 0),
+          (5, 'Machine',            1, 0),
+          (6, 'Cable',              1, 0),
+          (7, 'Band',               1, 0),
+          -- Отдельной строки «с довесом» нет: это то же самое снаряжение,
+          -- просто в подходе вписан ещё и вес блина. Пустой вес и есть
+          -- «только своим телом».
+          (8, 'Bodyweight',         1, 1);
+    `);
+    if (!hasEquipment) {
+      await db.execAsync(
+        `ALTER TABLE exercises ADD COLUMN equipment_id INTEGER REFERENCES equipment(id)`
+      );
+    }
+    version = 14;
   }
 
   // Штампуем версию, до которой реально догнали, а не LATEST_VERSION.

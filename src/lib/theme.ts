@@ -24,11 +24,13 @@ export const HEADER_DONE_PAUSED = '#dcb3b0';
 export const CARD_BG = '#00000008';
 export const SET_DONE_BG = '#e3f4e9';
 
-/** Отдых между подходами — холодная, «нерабочая» половина палитры. */
-export const REST_BG = '#eef3f7';
-export const REST_TEXT = '#5b6b78';
-export const REST_VALUE = '#2f4a5e';
-export const REST_HINT = '#98a2a8';
+/**
+ * Значения подхода. Серое — то, что подставилось из прошлого раза и ещё
+ * не подтверждено; чёрное — то, что записано в этой тренировке. Одно
+ * правило на всё: вес, повторы, время, RIR.
+ */
+export const VALUE_PENDING = '#9aa0a6';
+export const VALUE_DONE = '#1c1f21';
 
 /**
  * Разбор: тот же силуэт карточек, но холодный синий вместо рабочего серого
@@ -41,15 +43,16 @@ export const RECAP_SET_BG = '#f2f6f9';
 export const RECAP_FIELD_BG = '#ffffff';
 
 /**
- * Барабан RIR. Выбранное значение — тем же зелёным, что и записанный
- * подход: это и есть отметка о выполнении, просто с числом внутри.
+ * Барабан RIR подчиняется тому же правилу: пока подход не записан,
+ * выбранное значение серое — это «>5» по умолчанию, а не ответ. Как
+ * только значение выбрали, плашка темнеет.
  */
-export const RIR_ACTIVE = '#2c8746';
+export const RIR_ACTIVE = '#2f3437';
 export const RIR_ACTIVE_TEXT = '#ffffff';
+export const RIR_PENDING = '#d3d8db';
+export const RIR_PENDING_TEXT = '#7b8287';
 export const RIR_IDLE_BG = '#00000008';
 export const RIR_IDLE_TEXT = '#6b7278';
-/** Слот «не проставлен»: выбран, но это не ответ, а его отсутствие. */
-export const RIR_NONE = '#c2c8cc';
 
 /** Личный рекорд. */
 export const PR_BG = '#fbf1d3';

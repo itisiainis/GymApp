@@ -9,33 +9,29 @@ export function fmt(totalSeconds: number): string {
 }
 
 /**
- * Секунды → 12:46.317. Для всего, что меряется и потом вычитается:
- * длительность подхода, отдых, общее время.
+ * Секунды → 12:46.31. Для всего, что меряется и потом вычитается:
+ * длительность подхода и общее время.
  *
  * Целые секунды врали при вычитании, и это сбивало с толку: между 0:07 и
  * 0:12 на экране ровно пять секунд, а на деле от 4.01 до 5.99 — обе
- * границы округлены в свою сторону. С миллисекундами вычитать можно то,
- * что видишь.
+ * границы округлены в свою сторону. Двух знаков для этого достаточно:
+ * зал не лаборатория, а третий знак только мельтешит.
  */
 export function fmtMs(totalSeconds: number): string {
-  const total = Math.max(0, totalSeconds);
-  const whole = Math.floor(total);
-  const ms = Math.floor((total - whole) * 1000);
-  return `${fmt(whole)}.${String(ms).padStart(3, '0')}`;
+  // Округляем всё значение сразу, а не отрезаем дробную часть: 766.4 в
+  // двоичном виде чуть меньше себя, и (766.4 - 766) * 100 даёт 39.9999…,
+  // то есть «12:46.39» вместо «12:46.40». Заодно переполнение сотых само
+  // переходит в секунды: 5.999 → 0:06.00.
+  const hundredths = Math.round(Math.max(0, totalSeconds) * 100);
+  return `${fmt(Math.floor(hundredths / 100))}.${String(hundredths % 100).padStart(2, '0')}`;
 }
 
 /**
- * Как fmt, но отрицательное время остаётся отрицательным: -0:05.
+ * Как fmtMs, но отрицательное время остаётся отрицательным: -0:04.31.
  *
- * Нужно для отсчёта prepSeconds перед стартом подхода — иначе таймер
+ * Нужно отсчётам перед стартом — подхода и всей тренировки. Иначе таймер
  * молча стоит на 0:00, и непонятно, что это отсчёт, а не зависание.
  */
-export function fmtSigned(totalSeconds: number): string {
-  if (totalSeconds < 0) return `-${fmt(-totalSeconds)}`;
-  return fmt(totalSeconds);
-}
-
-/** То же с миллисекундами: -0:04.317 */
 export function fmtSignedMs(totalSeconds: number): string {
   if (totalSeconds < 0) return `-${fmtMs(-totalSeconds)}`;
   return fmtMs(totalSeconds);
@@ -72,54 +68,4 @@ export function liveSeconds(
 ): number {
   if (!runningSince) return activeSeconds;
   return activeSeconds + (now - Date.parse(runningSince)) / 1000;
-}
-
-/* ------------------------------------------------------------------ */
-/* Отдых между подходами                                               */
-/* ------------------------------------------------------------------ */
-
-/** Минимум, который подход должен дать таймингу, чтобы считаться за точку
- *  отсчёта отдыха. Строка без времени — это заготовка, её ещё не делали. */
-export interface Timed {
-  id: number;
-  started_at: string | null;
-  ended_at: string | null;
-}
-
-/**
- * Сколько отдыхали ПЕРЕД каждым подходом: от конца предыдущего записанного
- * подхода до начала этого.
- *
- * Считается по всей тренировке сразу, а не внутри упражнения: отдыхаешь-то
- * от всего разом, и пауза между последним подходом жима и первым подходом
- * тяги — такой же отдых, как между двумя подходами жима.
- *
- * Ключ — id подхода, поэтому перестановка карточек на экране ничего не
- * ломает: связь идёт по подходу, а не по позиции в списке.
- */
-export function restBySet(rows: Timed[]): Record<number, number> {
-  const done = rows
-    .filter((r) => r.started_at !== null)
-    .sort((a, b) => Date.parse(a.started_at!) - Date.parse(b.started_at!));
-
-  const out: Record<number, number> = {};
-  for (let i = 1; i < done.length; i++) {
-    const prevEnd = done[i - 1].ended_at;
-    if (!prevEnd) continue; // предыдущий подход ещё идёт — отдых не начался
-    const gap = (Date.parse(done[i].started_at!) - Date.parse(prevEnd)) / 1000;
-    // Срезка prepSeconds/reachSeconds сдвигает границы подхода внутрь, из-за
-    // чего очень короткая пауза может выйти отрицательной. Ноль честнее.
-    out[done[i].id] = Math.max(0, gap);
-  }
-  return out;
-}
-
-/** Когда закончился последний записанный подход — начало текущего отдыха. */
-export function lastEndedAt(rows: Timed[]): string | null {
-  let best: string | null = null;
-  for (const r of rows) {
-    if (!r.ended_at) continue;
-    if (best === null || Date.parse(r.ended_at) > Date.parse(best)) best = r.ended_at;
-  }
-  return best;
 }

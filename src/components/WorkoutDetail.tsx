@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import { ScrollView, Text, View } from 'react-native';
 import { getWorkoutDetail, type HistorySet, type WorkoutSummary } from '../db/library';
 import { useT } from '../lib/i18n';
+import { effectiveLoad, fmtKg } from '../lib/load';
 import { rirBadge } from '../lib/rir';
 import { fmt, fmtMs } from '../lib/time';
 import { localizeWorkoutName } from '../lib/workoutName';
@@ -12,8 +13,11 @@ function setLabel(s: HistorySet, t: (k: string) => string): string {
   const badge = rirBadge(s, t);
   const suffix = badge === null ? '' : ` · ${badge}`;
   if (s.measurement_default === 'hold' && s.active_seconds > 0) return fmtMs(s.active_seconds);
-  if (s.reps != null && s.weight_kg != null)
-    return `${s.reps} × ${s.weight_kg} ${t('kg')}${suffix}`;
+  // Показываем настоящую нагрузку: в подходе записан вес одной гантели
+  // или блин на поясе, а поднято — с учётом снаряжения (lib/load.ts).
+  const load = effectiveLoad(s.weight_kg, s, s.bodyweight_kg);
+  if (s.reps != null && load != null)
+    return `${s.reps} × ${fmtKg(load)} ${t('kg')}${suffix}`;
   if (s.reps != null) return `${s.reps} ${t('reps')}${suffix}`;
   if (s.active_seconds > 0) return fmtMs(s.active_seconds);
   return badge ?? '—';

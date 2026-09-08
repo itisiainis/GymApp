@@ -1,5 +1,5 @@
 import { useFocusEffect } from 'expo-router';
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Pressable, ScrollView, Text, TextInput, View } from 'react-native';
 import { ExerciseForm } from '../components/ExerciseForm';
 import { SwipeRow } from '../components/SwipeRow';
@@ -11,6 +11,7 @@ import {
 } from '../db/library';
 import { searchExercises, type Exercise } from '../db/queries';
 import { useT } from '../lib/i18n';
+import { exerciseTags, matchesQuery } from '../lib/tags';
 
 export default function Exercises() {
   const { t } = useT();
@@ -24,14 +25,22 @@ export default function Exercises() {
   const [error, setError] = useState('');
 
   const load = useCallback(() => {
-    searchExercises(query).then(setItems);
-  }, [query]);
+    searchExercises().then(setItems);
+  }, []);
 
   useFocusEffect(load);
   useEffect(load, [load]);
 
-  const mine = items.filter((e) => e.is_custom === 1);
-  const builtin = items.filter((e) => e.is_custom === 0);
+  // Поиск идёт по названию И по тегам — мышцам и снаряду: «бицепс штанга»
+  // находит то, что размечено обоими. Фильтруем в памяти, потому что
+  // переводы тегов известны только здесь (см. lib/tags.ts).
+  const found = useMemo(
+    () => items.filter((e) => matchesQuery(e, query, t)),
+    [items, query, t]
+  );
+
+  const mine = found.filter((e) => e.is_custom === 1);
+  const builtin = found.filter((e) => e.is_custom === 0);
 
   const openCard = async (id: number) => {
     setMuscles(await getExerciseMuscles(id));

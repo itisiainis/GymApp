@@ -25,10 +25,11 @@ export interface SetRowLive {
   measurement_default: 'reps' | 'hold';
   reps: number | null;
   weight_kg: number | null;
-  /** Повторов в запасе, 0–5; NULL при rir_missed = 0 — не проставлен. */
+  /** Повторов в запасе: 0–5, 6 = «>5». NULL — не проставлен. */
   rir: number | null;
-  /** 1 — «не дотянул». */
-  rir_missed: number;
+  /** Правила веса из снаряжения упражнения — см. lib/load.ts. */
+  weight_factor: number | null;
+  adds_bodyweight: number | null;
   started_at: string | null;
   /** Конец последнего закрытого интервала — от него считается отдых. */
   ended_at: string | null;
@@ -301,15 +302,17 @@ export async function getWorkoutSetsLive(workoutId: number): Promise<SetRowLive[
   return db.getAllAsync<SetRowLive>(
     `
     SELECT s.id, s.workout_id, s.exercise_id, s.reps, s.weight_kg,
-           s.rir, s.rir_missed,
+           s.rir,
            e.name AS exercise_name,
            e.measurement_default,
+           q.weight_factor, q.adds_bodyweight,
            t.started_at, t.ended_at, t.active_seconds, t.is_running,
            (SELECT i.started_at FROM set_intervals i
             WHERE i.set_id = s.id AND i.ended_at IS NULL
             LIMIT 1) AS running_since
     FROM sets s
     JOIN exercises e ON e.id = s.exercise_id
+    LEFT JOIN equipment q ON q.id = e.equipment_id
     JOIN set_times t ON t.set_id = s.id
     LEFT JOIN workout_exercise_order o
            ON o.workout_id = s.workout_id AND o.exercise_id = s.exercise_id

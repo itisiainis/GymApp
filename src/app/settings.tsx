@@ -125,38 +125,41 @@ export default function Settings() {
           <Text style={{ fontSize: 15 }}>{t('Record sets with a stopwatch')}</Text>
         </Pressable>
 
-        {rec.advancedReps && (
-          <View style={{ gap: 8, paddingLeft: 34 }}>
-            <Text style={{ color: '#888', fontSize: 13 }}>{t('Trim hint')}</Text>
+        {/* Срезка — своя настройка, а не приложение к секундомеру для
+            повторов: упражнения на время меряются таймером всегда, и
+            снятая галочка выше её не отменяет. Раньше она вместе с
+            галочкой пропадала с экрана, хотя продолжала действовать. */}
+        <Text style={{ fontWeight: '600', marginTop: 16 }}>{t('Trimming')}</Text>
+        <Text style={{ color: '#888', fontSize: 13 }}>{t('Trim hint')}</Text>
 
-            {([
-              ['prepSeconds', 'Trim at start'],
-              ['reachSeconds', 'Trim at end'],
-            ] as const).map(([key, label]) => (
-              <View
-                key={key}
-                style={{ flexDirection: 'row', alignItems: 'center', gap: 10 }}
-              >
-                <Text style={{ flex: 1 }}>{t(label)}</Text>
-                <TextInput
-                  keyboardType="numeric"
-                  value={String(rec[key])}
-                  onChangeText={(v) =>
-                    saveRec({ ...rec, [key]: Number(v.replace(/\D/g, '')) || 0 })
-                  }
-                  style={{
-                    width: 64,
-                    borderWidth: 1,
-                    borderColor: '#00000020',
-                    borderRadius: 8,
-                    padding: 8,
-                    textAlign: 'right',
-                  }}
-                />
-              </View>
-            ))}
-          </View>
-        )}
+        <View style={{ gap: 8 }}>
+          {([
+            ['prepSeconds', 'Trim at start'],
+            ['reachSeconds', 'Trim at end'],
+          ] as const).map(([key, label]) => (
+            <View
+              key={key}
+              style={{ flexDirection: 'row', alignItems: 'center', gap: 10 }}
+            >
+              <Text style={{ flex: 1 }}>{t(label)}</Text>
+              <TextInput
+                keyboardType="numeric"
+                value={String(rec[key])}
+                onChangeText={(v) =>
+                  saveRec({ ...rec, [key]: Number(v.replace(/\D/g, '')) || 0 })
+                }
+                style={{
+                  width: 64,
+                  borderWidth: 1,
+                  borderColor: '#00000020',
+                  borderRadius: 8,
+                  padding: 8,
+                  textAlign: 'right',
+                }}
+              />
+            </View>
+          ))}
+        </View>
 
         <Text style={{ fontWeight: '600', marginTop: 16 }}>{t('Backup')}</Text>
         <Text style={{ color: '#888', fontSize: 13 }}>{t('Backup hint')}</Text>

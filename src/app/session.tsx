@@ -17,6 +17,7 @@ import {
   discardWorkout,
   endWorkout,
   getActiveWorkout,
+  getLatestBodyweight,
   getWorkoutTotalSeconds,
   pauseWorkout,
   resumeWorkout,
@@ -49,8 +50,9 @@ import {
 import { DEFAULT_RECORDING, getRecordingSettings, type RecordingSettings } from '../db/settings';
 import { useT } from '../lib/i18n';
 import { hasRir, rirOf } from '../lib/rir';
+import { fmtKg } from '../lib/load';
 import { localizeWorkoutName } from '../lib/workoutName';
-import { fmtMs, lastEndedAt, liveSeconds, restBySet, useNow } from '../lib/time';
+import { fmtMs, liveSeconds, useNow } from '../lib/time';
 import {
   HEADER_DONE,
   HEADER_DONE_PAUSED,
@@ -59,11 +61,9 @@ import {
   HEADER_GREY_TEXT,
   RED,
   RED_DARK,
-  REST_BG,
-  REST_HINT,
-  REST_TEXT,
-  REST_VALUE,
   SET_DONE_BG,
+  VALUE_DONE,
+  VALUE_PENDING,
 } from '../lib/theme';
 import { setWorkoutActive } from '../lib/workoutLock';
 
@@ -73,6 +73,13 @@ const COLLAPSE_MS = 1000;
 const AUTO_COLLAPSE_DELAY_MS = 10_000;
 /** Отсчёт перед стартом тренировки — время дойти до снаряда. */
 const COUNTDOWN_SECONDS = 5;
+/**
+ * За сколько таймер проявляется, а кнопка перекрашивается. Короче самого
+ * отсчёта: растянутый на все пять секунд переход читался как медленное
+ * непонятное угасание, а за две секунды видно, что именно произошло — и
+ * дальше просто идёт отсчёт.
+ */
+const START_TRANSITION_MS = 2000;
 /** Во время реордеринга сворачиваем быстрее — это техническая пауза, а не
  *  «упражнение закрыто», задерживать взгляд на ней незачем. */
 const COLLAPSE_FAST_MS = 200;
@@ -121,6 +128,8 @@ export default function Session() {
   // выразить — у панели высота auto, и bottom: '100%' не резолвится
   const [barHeight, setBarHeight] = useState(0);
   const [rec, setRec] = useState<RecordingSettings>(DEFAULT_RECORDING);
+  /** Вес тела: нужен упражнениям, которые грузятся собственным телом. */
+  const [bodyweight, setBodyweight] = useState<number | null>(null);
 
   const running = rows.find((r) => r.is_running === 1) ?? null;
   const paused = workout?.is_paused === 1;
@@ -196,17 +205,6 @@ export default function Session() {
     return () => clearTimeout(id);
   }, [counting, beganMs]);
 
-  // Отдых, который уже сложился между записанными подходами: подписывается
-  // к каждому из них и дальше не меняется.
-  const restBefore = restBySet(rows);
-  /**
-   * Идущий отдых: время с конца последнего записанного подхода. Пока подход
-   * идёт, отдыха нет — там тикает свой таймер, и два счётчика рядом сбивали
-   * бы с толку. На паузе отдых считается: пауза — это тоже отдых, просто
-   * объявленный.
-   */
-  const lastEnd = lastEndedAt(rows);
-  const restSince = running === null ? lastEnd : null;
 
   // Каждый await рвёт автобатчинг React 18 - если звать setState между
   // ними, экран перерисовывался бы отдельно на каждый запрос к базе, и
@@ -253,13 +251,15 @@ export default function Session() {
       setRecent(recentList);
       return;
     }
-    const [recSettings, liveRows, exerciseNotes, routineList, recentList] = await Promise.all([
-      getRecordingSettings(),
-      getWorkoutSetsLive(w.id),
-      getExerciseNotes(w.id),
-      listRoutines(),
-      listRecentWorkouts(),
-    ]);
+    const [recSettings, liveRows, exerciseNotes, routineList, recentList, bw] =
+      await Promise.all([
+        getRecordingSettings(),
+        getWorkoutSetsLive(w.id),
+        getExerciseNotes(w.id),
+        listRoutines(),
+        listRecentWorkouts(),
+        getLatestBodyweight(),
+      ]);
     // Набранное, но ещё не доехавшее до базы, держим только для живых
     // подходов: SQLite переиспользует id удалённых строк, и оставленная
     // запись однажды подставила бы чужие цифры в новый подход.
@@ -274,6 +274,7 @@ export default function Session() {
     setNotes(exerciseNotes);
     setRoutines(routineList);
     setRecent(recentList);
+    setBodyweight(bw);
   }, []);
 
   /**
@@ -494,9 +495,11 @@ export default function Session() {
       startAnim.setValue(0);
       return;
     }
-    const total = COUNTDOWN_SECONDS * 1000;
-    const left = Math.max(0, beganMs - Date.now());
-    startAnim.setValue(Math.min(1, Math.max(0, 1 - left / total)));
+    // Сколько прошло с нажатия, а не сколько осталось до старта: переход
+    // короче отсчёта и живёт своей длительностью.
+    const passed = COUNTDOWN_SECONDS * 1000 - Math.max(0, beganMs - Date.now());
+    const left = Math.max(0, START_TRANSITION_MS - passed);
+    startAnim.setValue(Math.min(1, Math.max(0, passed / START_TRANSITION_MS)));
     if (left === 0) return;
     const anim = Animated.timing(startAnim, {
       toValue: 1,
@@ -685,23 +688,6 @@ export default function Session() {
                       }}
                       renderItem={(s, _i, isSetBeingDragged, startSetDrag) => (
                         <View>
-                          {/* Сколько отдыхали перед этим подходом. Стоит над
-                              ним, а не под предыдущим: отдых — это то, с чем
-                              подход подошёл к штанге, и читается он вместе
-                              со строкой, к которой относится. */}
-                          {restBefore[s.id] !== undefined && (
-                            <Text
-                              style={{
-                                fontSize: 11,
-                                color: REST_HINT,
-                                paddingLeft: 14,
-                                paddingBottom: 2,
-                              }}
-                            >
-                              ⏱ {t('rest')} {fmtMs(restBefore[s.id])}
-                            </Text>
-                          )}
-
                           <View style={{ flexDirection: 'row', alignItems: 'center', gap: 2 }}>
                             {/* Отдельная зона для драга: сама строка подхода
                                 почти целиком из полей ввода, зажать точно
@@ -740,6 +726,7 @@ export default function Session() {
                                   seconds={liveSeconds(s.active_seconds, s.running_since, now)}
                                   onChanged={refresh}
                                   onTyped={onTyped}
+                                  bodyweight={bodyweight}
                                   // при «Finish anyway» показываем, каких
                                   // именно подходов не хватает
                                   flagged={confirmFinish && !recorded(s)}
@@ -937,29 +924,6 @@ export default function Session() {
           висит над ними обеими, и по высоте одной панели оно наезжало бы
           на отдых. */}
       <View onLayout={(e) => setBarHeight(e.nativeEvent.layout.height)}>
-        {restSince !== null && (
-          <View
-            style={{
-              flexDirection: 'row',
-              alignItems: 'baseline',
-              justifyContent: 'center',
-              gap: 8,
-              paddingVertical: 6,
-              backgroundColor: REST_BG,
-              borderTopWidth: 1,
-              borderTopColor: '#00000010',
-            }}
-          >
-            <Text style={{ color: REST_TEXT, fontSize: 13, fontWeight: '600' }}>
-              {t('Rest')}
-            </Text>
-            <LiveTimer
-              since={restSince}
-              style={{ color: REST_VALUE, fontSize: 22, fontWeight: '700' }}
-            />
-          </View>
-        )}
-
         <View
           style={{
             flexDirection: 'row',
@@ -982,11 +946,14 @@ export default function Session() {
             <Text style={{ fontSize: 11, color: '#888' }} numberOfLines={1}>
               {t('Total')}
             </Text>
+            {/* Без знака: пока идёт отсчёт, значение отрицательное, и
+                таймер просто стоит на нуле — тренировка ещё не началась,
+                показывать ей минус нечего. Пойдёт он ровно тогда, когда
+                отсчёт кончится. */}
             <LiveTimer
               since={beganAt}
               base={-(workout?.paused_seconds ?? 0)}
               until={workout?.paused_since ?? null}
-              signed
               style={{ fontSize: 15, fontWeight: '700' }}
             />
           </Animated.View>
@@ -1008,9 +975,19 @@ export default function Session() {
                 opacity: locked || (!clockSet && groups.length === 0) ? 0.4 : 1,
               }}
             >
+              {/* Пока идёт отсчёт, на кнопке к подписи добавляется число
+                  секунд: подпись не меняется (отменить старт ещё можно, и
+                  «Finish» обещал бы другое действие), но видно, что
+                  происходит и сколько осталось.
+                  
+                  Округление вниз, а не вверх: так последняя секунда
+                  показывает ноль и держит его, пока досчитываются доли, —
+                  а не исчезает на единице, будто отсчёт оборвали. */}
               <Text style={{ color: '#fff', fontWeight: '700', fontSize: 16 }}>
                 {!live
-                  ? t("Let's start")
+                  ? counting
+                    ? `${t("Let's start")}  ${Math.floor((beganMs - now) / 1000)}`
+                    : t("Let's start")
                   : confirmFinish
                     ? t('Finish anyway')
                     : t('Finish')}
@@ -1161,6 +1138,7 @@ function SetLine({
   seconds,
   onChanged,
   onTyped,
+  bodyweight,
   flagged,
 }: {
   row: SetRowLive;
@@ -1172,6 +1150,8 @@ function SetLine({
   onChanged: () => void;
   /** Введённое прямо сейчас — до того, как оно доедет до базы и обратно. */
   onTyped: (setId: number, patch: { reps?: number | null; weightKg?: number | null }) => void;
+  /** Вес тела — для упражнений, которые грузятся собственным телом. */
+  bodyweight: number | null;
   /** Подход мешает завершить тренировку — пульсируем, чтобы его нашли. */
   flagged: boolean;
 }) {
@@ -1179,6 +1159,28 @@ function SetLine({
   const isRunning = row.is_running === 1;
   const isDone = !isRunning && row.started_at !== null;
   const prepping = timed && row.started_at !== null && seconds < 0;
+  const isHold = row.measurement_default === 'hold';
+  /**
+   * Серое — подставленное из прошлого раза и ещё не подтверждённое,
+   * чёрное — записанное в этой тренировке. Одно правило на вес, повторы,
+   * время и RIR: по цвету сразу видно, что уже сделано, а что просто
+   * лежит заготовкой.
+   */
+  const valueColor = isDone || isRunning ? VALUE_DONE : VALUE_PENDING;
+
+  /**
+   * Что дописать серым перед вводимым весом. Ровно та арифметика, которую
+   * приложение потом применит: вес тела прибавляется, пара гантелей
+   * удваивается. Веса тела нет в истории — не выдумываем и не показываем.
+   */
+  const loadPrefix =
+    row.adds_bodyweight === 1
+      ? bodyweight !== null
+        ? `${fmtKg(bodyweight)}${t('kg')}+`
+        : null
+      : (row.weight_factor ?? 1) !== 1
+        ? `${fmtKg(row.weight_factor ?? 1)}×`
+        : null;
 
   const pulse = useRef(new Animated.Value(0)).current;
 
@@ -1230,109 +1232,182 @@ function SetLine({
           не заставляя сначала где-то нажать, чтобы поле закрылось, — и
           набранное не теряется, если приложение закроют прямо сейчас.
           Экран при этом не обновляется: поля неуправляемые, и обновление
-          сбило бы каретку. */}
-      <TextInput
-        editable={!locked}
-        keyboardType="numeric"
-        placeholder={t('kg')}
-        defaultValue={row.weight_kg == null ? '' : String(row.weight_kg)}
-        onChangeText={(v) => onTyped(row.id, { weightKg: parseField(v) })}
-        onEndEditing={onChanged}
-        style={[inputStyle, { backgroundColor: locked ? 'transparent' : '#fff' }]}
-      />
+          сбило бы каретку.
 
-      <TextInput
-        editable={!locked}
-        keyboardType="numeric"
-        placeholder={t('reps')}
-        defaultValue={row.reps == null ? '' : String(row.reps)}
-        onChangeText={(v) => onTyped(row.id, { reps: parseField(v) })}
-        onEndEditing={onChanged}
-        style={[inputStyle, { backgroundColor: locked ? 'transparent' : '#fff' }]}
-      />
-
-      {/* Кнопка записи осталась только у секундомера. Подход на повторы
-          засчитывает барабан RIR — он стоит отдельной строкой под этой,
-          снаружи SwipeRow (см. session.tsx выше и RirDrum). */}
-      {timed && (
-        <Pressable
-          disabled={locked}
-          onPress={async () => {
-            if (isRunning) await stopSet(row.id);
-            else await startSet(row.id);
-            onChanged();
-          }}
-          style={{
-            paddingVertical: 8,
-            paddingHorizontal: 12,
-            backgroundColor: isRunning
-              ? RED_DARK
-              : locked
-                ? '#00000020'
-                : isDone
-                  ? '#2c8746'
-                  : '#3aa655',
-            borderRadius: 6,
-          }}
-        >
-          <Text style={{ color: '#fff', fontWeight: '700' }}>
-            {isRunning ? '❚❚' : isDone ? '✓' : '▶'}
+          Цвет текста говорит, откуда значение взялось: серое подставлено
+          из прошлого раза, чёрное — записано в этой тренировке. */}
+      {/* Формула нагрузки стоит прямо в поле, серым перед вводимым
+          числом: «71.4kg+» у упражнений со своим весом, «2×» у пары
+          гантелей. Вписывают то, что написано на снаряде, а из чего
+          складывается остальное — видно тут же, без отдельной строки с
+          готовым ответом. */}
+      <View
+        style={[
+          inputStyle,
+          {
+            flexDirection: 'row',
+            alignItems: 'center',
+            paddingVertical: 0,
+            paddingHorizontal: 0,
+            overflow: 'hidden',
+            backgroundColor: locked ? 'transparent' : '#fff',
+          },
+        ]}
+      >
+        {loadPrefix !== null && (
+          <Text style={{ paddingLeft: 6, fontSize: 13, color: VALUE_PENDING }}>
+            {loadPrefix}
           </Text>
-        </Pressable>
+        )}
+        <TextInput
+          editable={!locked}
+          keyboardType="numeric"
+          placeholder={t('kg')}
+          defaultValue={row.weight_kg == null ? '' : String(row.weight_kg)}
+          onChangeText={(v) => onTyped(row.id, { weightKg: parseField(v) })}
+          onEndEditing={onChanged}
+          style={{
+            flex: 1,
+            paddingVertical: 6,
+            paddingHorizontal: 6,
+            fontSize: 15,
+            color: valueColor,
+          }}
+        />
+      </View>
+
+      {/* У холда повторов нет: там меряется время, и пустое поле повторов
+          рядом с таймером только сбивало бы с толку. */}
+      {!isHold && (
+        <TextInput
+          editable={!locked}
+          keyboardType="numeric"
+          placeholder={t('reps')}
+          defaultValue={row.reps == null ? '' : String(row.reps)}
+          onChangeText={(v) => onTyped(row.id, { reps: parseField(v) })}
+          onEndEditing={onChanged}
+          style={[
+            inputStyle,
+            { backgroundColor: locked ? 'transparent' : '#fff', color: valueColor },
+          ]}
+        />
       )}
 
-      {timed &&
-        (isRunning ? (
-          // Во время самого подхода значение тикает — редактировать
-          // нечего. Тикает оно у себя внутри, с миллисекундами: общий
-          // счётчик экрана для такой частоты не годится, он тянул бы за
-          // собой весь список.
-          <LiveTimer
-            since={row.running_since}
-            base={row.active_seconds}
-            signed
-            style={{
-              width: 78,
-              textAlign: 'right',
-              color: prepping ? '#999' : undefined,
-              fontWeight: prepping ? '600' : undefined,
-            }}
-          />
-        ) : (
-          // ручной ввод секунд — для тех, кто засекает внешним секундомером
-          // и не хочет держаться за прижимной таймер приложения
-          <TextInput
-            editable={!locked}
-            keyboardType="numeric"
-            placeholder={t('sec')}
-            defaultValue={row.started_at ? String(Math.round(seconds)) : ''}
-            onEndEditing={async (e) => {
-              const v = e.nativeEvent.text.trim();
-              if (v === '') {
-                if (row.started_at) {
-                  await unrecordSet(row.id);
-                  onChanged();
-                }
-                return;
-              }
-              const n = Number(v);
-              if (!Number.isFinite(n) || n < 0) return;
-              await recordSetSeconds(row.id, Math.round(n));
+      {/* Кнопка таймера и значение — одно поле, а не кнопка и поле рядом:
+          нажимается там же, где читается результат. Рамка общая, кнопка
+          вложена слева.
+
+          Барабан RIR (у подходов на повторы без секундомера) стоит
+          отдельной строкой ниже, снаружи SwipeRow — см. RirDrum. */}
+      {timed && (
+        <View
+          style={[
+            inputStyle,
+            {
+              flexDirection: 'row',
+              alignItems: 'center',
+              paddingVertical: 0,
+              paddingHorizontal: 0,
+              overflow: 'hidden',
+              backgroundColor: locked ? 'transparent' : '#fff',
+              // Тянется вместе с остальными полями строки, а не стоит
+              // фиксированной ширины. Вдвое шире соседей: внутри не
+              // только число, но и кнопка на 38 точек, а само число со
+              // знаком и сотыми («-0:09.12») длиннее веса и повторов —
+              // с меньшим запасом оно переносилось на вторую строку.
+              flex: 2,
+            },
+          ]}
+        >
+          <Pressable
+            disabled={locked}
+            onPress={async () => {
+              if (isRunning) await stopSet(row.id);
+              else await startSet(row.id);
               onChanged();
             }}
-            style={[
-              inputStyle,
-              {
-                flex: 0,
-                width: 78,
+            style={{
+              // Фиксированная ширина: у «▶», «✓» и «❚❚» разная ширина
+              // глифа, и от кнопки по содержимому они получались разного
+              // размера — на глаз это читалось как разные кнопки.
+              width: 38,
+              alignSelf: 'stretch',
+              alignItems: 'center',
+              justifyContent: 'center',
+              backgroundColor: isRunning
+                ? RED_DARK
+                : locked
+                  ? '#00000020'
+                  : isDone
+                    ? '#2c8746'
+                    : '#3aa655',
+            }}
+          >
+            <Text style={{ color: '#fff', fontWeight: '700' }}>
+              {isRunning ? '❚❚' : isDone ? '✓' : '▶'}
+            </Text>
+          </Pressable>
+
+          {isRunning ? (
+            // Во время самого подхода значение тикает — редактировать
+            // нечего. Тикает оно у себя внутри: общий счётчик экрана для
+            // такой частоты не годится, он тянул бы за собой весь список.
+            <LiveTimer
+              since={row.running_since}
+              base={row.active_seconds}
+              signed
+              style={{
+                flex: 1,
                 textAlign: 'right',
-                backgroundColor: locked ? 'transparent' : '#fff',
-                color: isDone ? '#2c8746' : undefined,
-                fontWeight: isDone ? '600' : undefined,
-              },
-            ]}
-          />
-        ))}
+                paddingHorizontal: 6,
+                // Тот же вертикальный отступ, что у поля ввода ниже: без
+                // него коробка на время подхода становилась заметно ниже
+                // соседних полей — ровно в момент запуска.
+                paddingVertical: 6,
+                fontSize: 15,
+                color: prepping ? '#999' : VALUE_DONE,
+                fontWeight: prepping ? '600' : '400',
+              }}
+            />
+          ) : (
+            // ручной ввод секунд — для тех, кто засекает внешним
+            // секундомером и не хочет держаться за прижимной таймер
+            <TextInput
+              editable={!locked}
+              keyboardType="numeric"
+              placeholder={t('sec')}
+              // Со срезкой в конце (reachSeconds) остаток почти никогда
+              // не целый: округление до секунды показывало «5» там, где
+              // записано 5.23, — и это ровно то расхождение, из-за
+              // которого доли вообще появились на экране.
+              defaultValue={row.started_at ? seconds.toFixed(2) : ''}
+              onEndEditing={async (e) => {
+                const v = e.nativeEvent.text.trim();
+                if (v === '') {
+                  if (row.started_at) {
+                    await unrecordSet(row.id);
+                    onChanged();
+                  }
+                  return;
+                }
+                const n = Number(v.replace(',', '.'));
+                if (!Number.isFinite(n) || n < 0) return;
+                await recordSetSeconds(row.id, n);
+                onChanged();
+              }}
+              style={{
+                flex: 1,
+                textAlign: 'right',
+                paddingHorizontal: 6,
+                paddingVertical: 6,
+                fontSize: 15,
+                color: valueColor,
+                fontWeight: isDone ? '600' : '400',
+              }}
+            />
+          )}
+        </View>
+      )}
     </Animated.View>
   );
 }

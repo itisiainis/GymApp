@@ -33,6 +33,7 @@ export async function updateExercise(
     name: string;
     description?: string;
     measurementDefault: 'reps' | 'hold';
+    equipmentId?: number | null;
     muscles: { muscleId: number; role: MuscleRole }[];
   }
 ): Promise<void> {
@@ -46,9 +47,16 @@ export async function updateExercise(
 
   await db.withTransactionAsync(async () => {
     await db.runAsync(
-      `UPDATE exercises SET name = ?, description = ?, measurement_default = ?
+      `UPDATE exercises SET name = ?, description = ?, measurement_default = ?,
+              equipment_id = ?
        WHERE id = ?`,
-      [input.name, input.description ?? null, input.measurementDefault, exerciseId]
+      [
+        input.name,
+        input.description ?? null,
+        input.measurementDefault,
+        input.equipmentId ?? null,
+        exerciseId,
+      ]
     );
     await db.runAsync('DELETE FROM exercise_muscles WHERE exercise_id = ?', [exerciseId]);
     for (const m of input.muscles) {
@@ -66,6 +74,7 @@ export interface ExerciseFull {
   description: string | null;
   measurement_default: 'reps' | 'hold';
   is_custom: number;
+  equipment_id: number | null;
 }
 
 export async function getExercise(exerciseId: number): Promise<ExerciseFull | null> {
@@ -141,6 +150,24 @@ export async function deleteExercise(exerciseId: number): Promise<void> {
       await db.runAsync('DELETE FROM exercises WHERE id = ?', [exerciseId]);
     }
   });
+}
+
+/* ---------------- Снаряжение ---------------- */
+
+/**
+ * Снаряд упражнения. Кроме поиска по тегу несёт правила веса: множитель
+ * (пара гантелей — 2) и признак «грузится собственным телом».
+ */
+export interface Equipment {
+  id: number;
+  name: string;
+  weight_factor: number;
+  adds_bodyweight: number;
+}
+
+export async function listEquipment(): Promise<Equipment[]> {
+  const db = await getDb();
+  return db.getAllAsync<Equipment>('SELECT * FROM equipment ORDER BY id');
 }
 
 /* ---------------- Состав шаблона ---------------- */
@@ -277,9 +304,13 @@ export interface HistorySet {
   weight_kg: number | null;
   /** У подходов, записанных до перехода на RIR, его нет и не будет. */
   rir: number | null;
-  rir_missed: number;
   active_seconds: number;
   started_at: string | null;
+  /** Правила веса из снаряжения — чтобы показать настоящую нагрузку. */
+  weight_factor: number | null;
+  adds_bodyweight: number | null;
+  /** Вес тела на момент ТОЙ тренировки, а не сегодняшний. */
+  bodyweight_kg: number | null;
 }
 
 export async function getWorkoutDetail(workoutId: number): Promise<HistorySet[]> {
@@ -287,10 +318,16 @@ export async function getWorkoutDetail(workoutId: number): Promise<HistorySet[]>
   return db.getAllAsync<HistorySet>(
     `
     SELECT s.id, s.exercise_id, e.name AS exercise_name, e.measurement_default,
-           s.reps, s.weight_kg, s.rir, s.rir_missed, t.active_seconds, t.started_at
+           s.reps, s.weight_kg, s.rir, t.active_seconds, t.started_at,
+           q.weight_factor, q.adds_bodyweight,
+           (SELECT b.weight_kg FROM bodyweight b
+            WHERE b.measured_at <= COALESCE(w.began_at, w.started_at)
+            ORDER BY b.measured_at DESC LIMIT 1) AS bodyweight_kg
     FROM sets s
-    JOIN exercises e ON e.id = s.exercise_id
-    JOIN set_times t ON t.set_id = s.id
+    JOIN exercises e  ON e.id = s.exercise_id
+    JOIN workouts w   ON w.id = s.workout_id
+    LEFT JOIN equipment q ON q.id = e.equipment_id
+    JOIN set_times t  ON t.set_id = s.id
     WHERE s.workout_id = ?
     ORDER BY t.started_at IS NULL, t.started_at, s.id
     `,
@@ -372,10 +409,12 @@ export interface RecapSet {
   reps: number | null;
   weight_kg: number | null;
   rir: number | null;
-  rir_missed: number;
   active_seconds: number;
   started_at: string | null;
   ended_at: string | null;
+  weight_factor: number | null;
+  adds_bodyweight: number | null;
+  bodyweight_kg: number | null;
   /** Рекорд: результат лучше всего, что было по этому упражнению раньше. */
   is_pr: number;
 }
@@ -386,6 +425,11 @@ export interface RecapSet {
  * Рекорд считаем по трём меркам, в зависимости от того, чем меряется
  * упражнение: вес, число повторов при своём весе, время удержания.
  * Сравниваем только с тренировками, которые были ДО этой.
+ *
+ * Сравнение идёт по ВВЕДЁННОМУ весу, а не по настоящей нагрузке, и это
+ * не упущение: снаряжение у упражнения одно, множитель с обеих сторон
+ * одинаков, а вес тела между тренировками меняется — рекорды по жиму
+ * прыгали бы от того, что человек поел.
  */
 export async function getWorkoutRecap(workoutId: number): Promise<RecapSet[]> {
   const db = await getDb();
@@ -404,8 +448,12 @@ export async function getWorkoutRecap(workoutId: number): Promise<RecapSet[]> {
       GROUP BY s.exercise_id
     )
     SELECT s.id, s.exercise_id, e.name AS exercise_name, e.measurement_default,
-           s.reps, s.weight_kg, s.rir, s.rir_missed,
+           s.reps, s.weight_kg, s.rir,
            t.active_seconds, t.started_at, t.ended_at,
+           q.weight_factor, q.adds_bodyweight,
+           (SELECT b.weight_kg FROM bodyweight b
+            WHERE b.measured_at <= COALESCE(w2.began_at, w2.started_at)
+            ORDER BY b.measured_at DESC LIMIT 1) AS bodyweight_kg,
            CASE
              WHEN e.measurement_default = 'hold'
                THEN CASE WHEN t.active_seconds > COALESCE(p.best_seconds, 0) THEN 1 ELSE 0 END
@@ -415,6 +463,8 @@ export async function getWorkoutRecap(workoutId: number): Promise<RecapSet[]> {
            END AS is_pr
     FROM sets s
     JOIN exercises e ON e.id = s.exercise_id
+    JOIN workouts w2 ON w2.id = s.workout_id
+    LEFT JOIN equipment q ON q.id = e.equipment_id
     JOIN set_times t ON t.set_id = s.id
     LEFT JOIN prior p ON p.exercise_id = s.exercise_id
     LEFT JOIN workout_exercise_order o

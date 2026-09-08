@@ -1,58 +1,40 @@
-import { useEffect, useRef, useState } from 'react';
-import { Pressable, ScrollView, Text, View } from 'react-native';
+import { useRef, useState } from 'react';
+import { PanResponder, Pressable, Text, View } from 'react-native';
 import { useT } from '../lib/i18n';
-import { RIR_MISSED, RIR_OPTIONS, rirLabel, type RirValue } from '../lib/rir';
+import { RIR_DEFAULT, RIR_OPTIONS, rirLabel, type RirValue } from '../lib/rir';
 import {
   RIR_ACTIVE,
   RIR_ACTIVE_TEXT,
   RIR_IDLE_BG,
   RIR_IDLE_TEXT,
-  RIR_NONE,
+  RIR_PENDING,
+  RIR_PENDING_TEXT,
 } from '../lib/theme';
 
 /**
- * Ввод RIR — барабан: свободный свайп со снапом по значениям.
+ * Ввод RIR — шкала во всю ширину: все семь значений видны сразу, и
+ * добираться до крайних прокруткой не нужно.
  *
- * Не кнопки и не клавиатура: значений семь, они на одной шкале, и выбор
- * из шкалы — это движение вдоль неё, а не попадание пальцем в одну из
- * семи мелких мишеней.
+ * Раньше это был барабан с прокруткой, и половина шкалы всегда оставалась
+ * за краем — на каждый выбор приходился лишний скролл. Выбор из шкалы
+ * по-прежнему остаётся движением вдоль неё: палец ведёт по значениям, и
+ * они подсвечиваются под ним; тап по значению — то же самое одним
+ * касанием.
  *
- * ВАЖНО, где он стоит. Барабан горизонтальный, и строка подхода завёрнута
- * в SwipeRow, который ловит горизонтальный свайп для удаления. Вложить
- * одно в другое — тот самый конфликт жестов, из-за которого свайп подхода
- * когда-то удалял всё упражнение. Поэтому барабан живёт на СВОЕЙ строке,
- * снаружи SwipeRow (см. session.tsx), а не внутри SetLine. Не переносить
- * внутрь в надежде, что жесты договорятся сами — не договорятся.
+ * Пока подход не записан, шкала стоит на «>5» и покрашена серым: это
+ * осмысленное положение («ещё много»), а не прочерк, но и не ответ.
+ * Отдельного слота «не проставлено» нет — то, что подход ещё не записан,
+ * видно по цвету, как и у остальных значений подхода.
  *
- * Сделан на обычном ScrollView со snapToOffsets: reanimated в проект
- * ставить нельзя (v4 не работает в Expo Go, см. REDESIGN.md).
+ * ВАЖНО, где она стоит. Жест горизонтальный, и строка подхода завёрнута в
+ * SwipeRow, который ловит горизонтальный свайп для удаления. Вложить одно
+ * в другое — тот самый конфликт жестов, из-за которого свайп подхода
+ * когда-то удалял всё упражнение. Поэтому шкала живёт на СВОЕЙ строке,
+ * снаружи SwipeRow (см. session.tsx), а не внутри SetLine.
  */
 
-/** Слот «не проставлен». Формально не значение шкалы, но нужен барабану:
- *  свежий подход должен где-то стоять, и с него же должен быть путь
- *  обратно — снять отметку, не удаляя сам подход. */
-const NONE = 'none';
-type Slot = RirValue | typeof NONE;
-
-const SLOTS: Slot[] = [NONE, ...RIR_OPTIONS];
-
-/** Ширины разные: «не дотянул» — слово, остальные — один символ.
- *  Поэтому снап идёт по snapToOffsets, а не по snapToInterval. */
-const WIDTH_NUMBER = 42;
-const WIDTH_MISSED = 96;
-const WIDTH_NONE = 42;
-
-function slotWidth(s: Slot): number {
-  if (s === NONE) return WIDTH_NONE;
-  if (s === RIR_MISSED) return WIDTH_MISSED;
-  return WIDTH_NUMBER;
-}
-
-const WIDTHS = SLOTS.map(slotWidth);
-
 function indexOfValue(value: RirValue | null): number {
-  if (value === null) return 0;
-  const i = SLOTS.indexOf(value);
+  const i = RIR_OPTIONS.indexOf(value ?? RIR_DEFAULT);
   return i === -1 ? 0 : i;
 }
 
@@ -61,155 +43,129 @@ export function RirDrum({
   onChange,
   disabled = false,
 }: {
-  /** null — RIR не проставлен. */
+  /** null — RIR не проставлен: шкала стоит на «>5» и покрашена серым. */
   value: RirValue | null;
   /** null означает «снять отметку». */
   onChange: (next: RirValue | null) => void;
   disabled?: boolean;
 }) {
   const { t } = useT();
-  const scroller = useRef<ScrollView>(null);
   const [width, setWidth] = useState(0);
+  /** Значение под пальцем, пока ведут. null — не ведут. */
+  const [dragIndex, setDragIndex] = useState<number | null>(null);
 
   const selected = indexOfValue(value);
+  const shown = dragIndex ?? selected;
+  const itemWidth = width > 0 ? width / RIR_OPTIONS.length : 0;
 
-  /** Что уже отдано наружу: и чтобы не писать в базу одно и то же, и чтобы
-   *  отличить «значение пришло снаружи» от «его только что выбрали здесь». */
-  const committed = useRef(selected);
-  /** Инерция после броска ещё не началась — см. onScrollEndDrag. */
-  const settle = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // PanResponder создаётся один раз, поэтому всё, что меняется от
+  // рендера к рендеру, читаем через ref — иначе жест застрянет на
+  // значениях первого рендера (та же причина, что в SwipeRow).
+  const state = useRef({ selected, itemWidth, disabled, onChange, value });
+  state.current = { selected, itemWidth, disabled, onChange, value };
+  const startIndex = useRef(0);
 
-  // Смещение, при котором i-й слот стоит по центру. Крайние слоты тоже
-  // должны доезжать до центра, отсюда боковые отступы у контента.
-  const padLeft = width > 0 ? (width - WIDTHS[0]) / 2 : 0;
-  const padRight = width > 0 ? (width - WIDTHS[WIDTHS.length - 1]) / 2 : 0;
-  const offsets: number[] = [];
-  let left = padLeft;
-  for (const w of WIDTHS) {
-    offsets.push(left + w / 2 - width / 2);
-    left += w;
-  }
+  const clamp = (i: number) => Math.min(RIR_OPTIONS.length - 1, Math.max(0, i));
 
-  const scrollTo = (index: number, animated: boolean) => {
-    if (width === 0) return;
-    scroller.current?.scrollTo({ x: offsets[index], y: 0, animated });
-  };
-
-  // Значение пришло снаружи (обновление после записи, чужая правка,
-  // первая отрисовка) — подводим барабан к нему. Свой же выбор сюда тоже
-  // попадает, но там позиция уже верная, и scrollTo ничего не двигает.
-  useEffect(() => {
-    if (committed.current === selected) return;
-    committed.current = selected;
-    scrollTo(selected, true);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selected, width]);
-
-  // Первая отрисовка: ширина известна только после layout, до неё
-  // scrollTo молчит — поэтому ставим позицию, как только она появилась.
-  useEffect(() => {
-    if (width === 0) return;
-    scrollTo(indexOfValue(value), false);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [width]);
-
-  const commit = (index: number) => {
-    if (settle.current) {
-      clearTimeout(settle.current);
-      settle.current = null;
-    }
-    if (index === committed.current) return;
-    committed.current = index;
-    const slot = SLOTS[index];
-    onChange(slot === NONE ? null : slot);
-  };
-
-  /** Ближайший слот к текущему положению. */
-  const nearest = (x: number): number => {
-    let best = 0;
-    for (let i = 1; i < offsets.length; i++) {
-      if (Math.abs(offsets[i] - x) < Math.abs(offsets[best] - x)) best = i;
-    }
-    return best;
-  };
+  const responder = useRef(
+    PanResponder.create({
+      // Не на старте касания, а только на заметно горизонтальном движении:
+      // иначе шкала перехватывала бы вертикальную прокрутку списка.
+      onMoveShouldSetPanResponder: (_, g) =>
+        !state.current.disabled &&
+        state.current.itemWidth > 0 &&
+        Math.abs(g.dx) > 6 &&
+        Math.abs(g.dx) > Math.abs(g.dy) * 1.5,
+      onPanResponderGrant: () => {
+        startIndex.current = state.current.selected;
+        setDragIndex(state.current.selected);
+      },
+      // Сдвиг считаем от начала жеста, а не от координат на экране: так
+      // не нужно знать, где именно шкала лежит на странице.
+      onPanResponderMove: (_, g) => {
+        const steps = Math.round(g.dx / state.current.itemWidth);
+        setDragIndex(
+          Math.min(RIR_OPTIONS.length - 1, Math.max(0, startIndex.current + steps))
+        );
+      },
+      onPanResponderRelease: (_, g) => {
+        const steps = Math.round(g.dx / state.current.itemWidth);
+        const next = Math.min(
+          RIR_OPTIONS.length - 1,
+          Math.max(0, startIndex.current + steps)
+        );
+        setDragIndex(null);
+        // Довели до того же значения — но если подход ещё не записан, это
+        // первый осознанный выбор, и записать его надо.
+        if (next !== state.current.selected || state.current.value === null) {
+          state.current.onChange(RIR_OPTIONS[next]);
+        }
+      },
+      onPanResponderTerminate: () => setDragIndex(null),
+    })
+  ).current;
 
   return (
-    <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8, opacity: disabled ? 0.35 : 1 }}>
+    <View
+      style={{ flexDirection: 'row', alignItems: 'center', gap: 8, opacity: disabled ? 0.35 : 1 }}
+    >
       <Text style={{ fontSize: 12, fontWeight: '700', color: RIR_IDLE_TEXT, width: 30 }}>
         {t('RIR')}
       </Text>
 
-      <View style={{ flex: 1 }} onLayout={(e) => setWidth(e.nativeEvent.layout.width)}>
-        <ScrollView
-          ref={scroller}
-          horizontal
-          scrollEnabled={!disabled}
-          showsHorizontalScrollIndicator={false}
-          decelerationRate="fast"
-          snapToOffsets={width > 0 ? offsets : undefined}
-          contentContainerStyle={{ paddingLeft: padLeft, paddingRight: padRight }}
-          // Инерция начинается не всегда: медленно отпущенный барабан
-          // доезжает до снапа без неё, и momentum-события не будет. Ждём
-          // его чуть-чуть, а если не пришло — записываем сами.
-          onScrollEndDrag={(e) => {
-            const x = e.nativeEvent.contentOffset.x;
-            if (settle.current) clearTimeout(settle.current);
-            settle.current = setTimeout(() => commit(nearest(x)), 120);
-          }}
-          onMomentumScrollBegin={() => {
-            if (settle.current) {
-              clearTimeout(settle.current);
-              settle.current = null;
-            }
-          }}
-          onMomentumScrollEnd={(e) => commit(nearest(e.nativeEvent.contentOffset.x))}
-        >
-          {SLOTS.map((slot, i) => {
-            const isSelected = i === selected;
-            const isNone = slot === NONE;
-            return (
-              <Pressable
-                key={String(slot)}
-                disabled={disabled}
-                // Тап — тот же барабан, просто подвинутый пальцем в одно
-                // касание: значение всё равно приезжает в центр.
-                onPress={() => {
-                  scrollTo(i, true);
-                  commit(i);
-                }}
+      <View
+        style={{ flex: 1, flexDirection: 'row' }}
+        onLayout={(e) => setWidth(e.nativeEvent.layout.width)}
+        {...(disabled ? {} : responder.panHandlers)}
+      >
+        {RIR_OPTIONS.map((slot, i) => {
+          const isSelected = i === shown;
+          // Пока ведут пальцем, значение ещё не записано — подсветка
+          // показывает, на чём остановишься, а не что уже выбрано.
+          const isAnswer = isSelected && (dragIndex !== null || value !== null);
+          return (
+            <Pressable
+              key={slot}
+              disabled={disabled}
+              // Тап — то же движение по шкале, только в одно касание.
+              // Повторный тап по выбранному снимает отметку: другого пути
+              // назад у шкалы без слота «не проставлено» нет.
+              onPress={() => {
+                if (i === selected && value !== null) onChange(null);
+                else onChange(RIR_OPTIONS[i]);
+              }}
+              style={{ flex: 1, paddingHorizontal: 2, paddingVertical: 4 }}
+            >
+              <View
                 style={{
-                  width: WIDTHS[i],
-                  paddingHorizontal: 3,
-                  paddingVertical: 4,
+                  borderRadius: 999,
+                  paddingVertical: 5,
+                  alignItems: 'center',
+                  backgroundColor: isSelected
+                    ? isAnswer
+                      ? RIR_ACTIVE
+                      : RIR_PENDING
+                    : RIR_IDLE_BG,
                 }}
               >
-                <View
+                <Text
+                  numberOfLines={1}
                   style={{
-                    borderRadius: 999,
-                    paddingVertical: 5,
-                    alignItems: 'center',
-                    backgroundColor: isSelected
-                      ? isNone
-                        ? RIR_NONE
-                        : RIR_ACTIVE
-                      : RIR_IDLE_BG,
+                    fontSize: 13,
+                    fontWeight: isSelected ? '700' : '500',
+                    color: isSelected
+                      ? isAnswer
+                        ? RIR_ACTIVE_TEXT
+                        : RIR_PENDING_TEXT
+                      : RIR_IDLE_TEXT,
                   }}
                 >
-                  <Text
-                    numberOfLines={1}
-                    style={{
-                      fontSize: isNone || slot === RIR_MISSED ? 11 : 14,
-                      fontWeight: isSelected ? '700' : '500',
-                      color: isSelected ? RIR_ACTIVE_TEXT : RIR_IDLE_TEXT,
-                    }}
-                  >
-                    {isNone ? '—' : rirLabel(slot, t)}
-                  </Text>
-                </View>
-              </Pressable>
-            );
-          })}
-        </ScrollView>
+                  {rirLabel(slot)}
+                </Text>
+              </View>
+            </Pressable>
+          );
+        })}
       </View>
     </View>
   );

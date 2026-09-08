@@ -3,8 +3,9 @@ import { Pressable, ScrollView, Text, TextInput, View } from 'react-native';
 import { getWorkoutMeta, getWorkoutRecap, type RecapSet } from '../db/library';
 import { getExerciseNotes, saveWorkoutAsRoutine } from '../db/workout-session';
 import { useT } from '../lib/i18n';
-import { rirCompact } from '../lib/rir';
-import { fmtMs, restBySet } from '../lib/time';
+import { effectiveLoad, fmtKg } from '../lib/load';
+import { rirBadge } from '../lib/rir';
+import { fmtMs } from '../lib/time';
 import { localizeWorkoutName } from '../lib/workoutName';
 import {
   CARD_BG,
@@ -14,7 +15,6 @@ import {
   RECAP_HEADER,
   RECAP_HEADER_TEXT,
   RECAP_SET_BG,
-  REST_HINT,
 } from '../lib/theme';
 import { SheetModal } from './SheetModal';
 
@@ -76,7 +76,6 @@ export function WorkoutRecap({
   }, [workoutId]);
 
   const prs = sets.filter((s) => s.is_pr === 1);
-  const restBefore = restBySet(sets);
 
   const groups: { id: number; name: string; sets: RecapSet[] }[] = [];
   for (const s of sets) {
@@ -90,7 +89,8 @@ export function WorkoutRecap({
 
   const label = (s: RecapSet) => {
     if (s.measurement_default === 'hold' && s.active_seconds > 0) return fmtMs(s.active_seconds);
-    if (s.reps != null && s.weight_kg != null) return `${s.reps} × ${s.weight_kg} ${t('kg')}`;
+    const load = effectiveLoad(s.weight_kg, s, s.bodyweight_kg);
+    if (s.reps != null && load != null) return `${s.reps} × ${fmtKg(load)} ${t('kg')}`;
     if (s.reps != null) return `${s.reps} ${t('reps')}`;
     if (s.active_seconds > 0) return fmtMs(s.active_seconds);
     return '—';
@@ -178,21 +178,7 @@ export function WorkoutRecap({
 
             <View style={{ gap: 6, marginTop: 8 }}>
               {g.sets.map((s) => (
-                <View key={s.id}>
-                  {restBefore[s.id] !== undefined && (
-                    <Text
-                      style={{
-                        fontSize: 11,
-                        color: REST_HINT,
-                        paddingLeft: 14,
-                        paddingBottom: 2,
-                      }}
-                    >
-                      ⏱ {t('rest')} {fmtMs(restBefore[s.id])}
-                    </Text>
-                  )}
-                  <RecapSetLine set={s} />
-                </View>
+                <RecapSetLine key={s.id} set={s} />
               ))}
 
               {!!notes[g.id] && (
@@ -359,7 +345,7 @@ function RecapSetLine({ set }: { set: RecapSet }) {
         opacity: done ? 1 : 0.45,
       }}
     >
-      <Field value={set.weight_kg} unit={t('kg')} bold={isPr} />
+      <Field value={effectiveLoad(set.weight_kg, set, set.bodyweight_kg)} unit={t('kg')} bold={isPr} />
       <Field value={set.reps} unit={t('reps')} bold={isPr} />
 
       {/* та же кнопка по месту и размеру, но плашка: нажимать нечего */}
@@ -388,7 +374,7 @@ function RecapSetLine({ set }: { set: RecapSet }) {
           fontWeight: '600',
         }}
       >
-        {set.active_seconds > 0 ? fmtMs(set.active_seconds) : (rirCompact(set, t) ?? '')}
+        {set.active_seconds > 0 ? fmtMs(set.active_seconds) : (rirBadge(set, t) ?? '')}
       </Text>
     </View>
   );
@@ -423,7 +409,7 @@ function Field({
           fontWeight: bold ? '700' : '400',
         }}
       >
-        {value == null ? '—' : `${value} ${unit}`}
+        {value == null ? '—' : `${fmtKg(value)} ${unit}`}
       </Text>
     </View>
   );
