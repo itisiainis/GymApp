@@ -25,6 +25,10 @@ export function SwipeRow({
   // на первом же рендере: строка осталась бы свайпаемой во время подхода.
   const disabledRef = useRef(disabled);
   disabledRef.current = disabled;
+  // И onDelete по той же причине: иначе удалялось бы то, что было в
+  // замыкании первого рендера, а не текущее.
+  const onDeleteRef = useRef(onDelete);
+  onDeleteRef.current = onDelete;
 
   const responder = useRef(
     PanResponder.create({
@@ -40,7 +44,7 @@ export function SwipeRow({
             toValue: -500,
             duration: 150,
             useNativeDriver: true,
-          }).start(onDelete);
+          }).start(() => onDeleteRef.current());
         } else {
           Animated.spring(dx, { toValue: 0, useNativeDriver: true }).start();
         }

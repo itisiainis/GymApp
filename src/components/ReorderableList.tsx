@@ -51,6 +51,16 @@ export function ReorderableList<T>({
   targetRef.current = target;
   itemsRef.current = items;
 
+  // Колбэки — туда же. Без этого отпущенная карточка звала onReorder с
+  // первого рендера: экран тренировки монтирует список ещё до того, как
+  // тренировка заведена, и в том замыкании workout был null. Новый порядок
+  // успевал встать на экран, но в базу не писался — и первый же refresh
+  // (RIR, ввод веса) возвращал старый.
+  const onReorderRef = useRef(onReorder);
+  const onDraggingChangeRef = useRef(onDraggingChange);
+  onReorderRef.current = onReorder;
+  onDraggingChangeRef.current = onDraggingChange;
+
   const heightOf = (item: T) => heights.current[String(keyOf(item))] ?? 0;
 
   /** В чей слот попал центр перетаскиваемой карточки при смещении offset. */
@@ -76,7 +86,7 @@ export function ReorderableList<T>({
     dy.setValue(0);
     setDragIndex(null);
     setTarget(null);
-    onDraggingChange?.(false);
+    onDraggingChangeRef.current?.(false);
   };
 
   /**
@@ -141,7 +151,7 @@ export function ReorderableList<T>({
         dy.setValue(delta);
 
         awaitingOrder.current = true;
-        onDraggingChange?.(false);
+        onDraggingChangeRef.current?.(false);
 
         // Страховка: если порядок так и не пришёл (например, запись в базу
         // не удалась), список не должен остаться со сдвинутыми карточками.
@@ -154,7 +164,7 @@ export function ReorderableList<T>({
         const next = [...list];
         const [moved] = next.splice(from, 1);
         next.splice(to, 0, moved);
-        onReorder(next);
+        onReorderRef.current(next);
       },
       onPanResponderTerminate: stop,
     })

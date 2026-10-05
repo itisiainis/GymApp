@@ -58,14 +58,54 @@ export function useNow(active: boolean, intervalMs = 500): number {
 }
 
 /**
- * Сколько секунд идёт подход. now передаётся снаружи, чтобы значение
- * пересчитывалось при каждом тике, а не бралось из скрытого Date.now().
+ * Текущее время, обновляемое на каждый кадр экрана.
+ *
+ * Для бегущих сотых. setInterval не связан с частотой экрана и на занятом
+ * потоке сбивается — сотые шли пачками. requestAnimationFrame приходит
+ * ровно к очередному кадру, а чаще кадра показывать всё равно нечего.
  */
-export function liveSeconds(
-  activeSeconds: number,
-  runningSince: string | null,
-  now: number
-): number {
-  if (!runningSince) return activeSeconds;
-  return activeSeconds + (now - Date.parse(runningSince)) / 1000;
+export function useFrameNow(active: boolean): number {
+  const [now, setNow] = useState(() => Date.now());
+
+  useEffect(() => {
+    if (!active) return;
+    let id = requestAnimationFrame(function tick() {
+      setNow(Date.now());
+      id = requestAnimationFrame(tick);
+    });
+    return () => cancelAnimationFrame(id);
+  }, [active]);
+
+  return now;
+}
+
+/**
+ * Наступил ли уже момент atMs. Перерисовывает один раз — когда наступит, —
+ * а не тикает всё это время.
+ *
+ * Для разовых переключений по времени (кончился отсчёт, подход идёт пятую
+ * минуту). Раньше ради них на весь экран тикал общий now, и список со
+ * всеми полями ввода перерисовывался дважды в секунду — бегущие сотые на
+ * этих перерисовках спотыкались.
+ */
+export function useReached(atMs: number | null): boolean {
+  // Начальное значение считается сразу: иначе уже наступивший момент на
+  // первом кадре выглядел бы ненаступившим, и на экране идущей тренировки
+  // мигала бы кнопка «Let's start».
+  const [reachedFor, setReachedFor] = useState<number | null>(() =>
+    atMs !== null && Date.now() >= atMs ? atMs : null
+  );
+
+  useEffect(() => {
+    if (atMs === null) return;
+    const left = atMs - Date.now();
+    if (left <= 0) {
+      setReachedFor(atMs);
+      return;
+    }
+    const id = setTimeout(() => setReachedFor(atMs), left);
+    return () => clearTimeout(id);
+  }, [atMs]);
+
+  return atMs !== null && reachedFor === atMs;
 }

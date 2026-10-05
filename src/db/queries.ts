@@ -409,21 +409,38 @@ export async function unrecordSet(setId: number): Promise<void> {
  * иначе один и тот же подход считался бы по-разному в зависимости от
  * способа записи, а этого быть не должно.
  *
+ * Но только при первой записи. Если у подхода время уже есть, в поле
+ * стоит уже срезанное значение, и правят именно его: срезать повторно
+ * значило бы уменьшать подход при каждой правке.
+ *
  * Доли секунды не округляем: после срезки остаток и так почти никогда не
  * целый, а показываются времена с сотыми — округлив здесь, мы бы
  * записали не то, что потом покажем.
  */
 export async function recordSetSeconds(setId: number, seconds: number): Promise<void> {
   const db = await getDb();
-  const ts = now();
-  const ctx = await db.getFirstAsync<{ workout_id: number }>(
-    'SELECT workout_id FROM sets WHERE id = ?',
+  const ctx = await db.getFirstAsync<{ workout_id: number; recorded: number }>(
+    `SELECT s.workout_id,
+            EXISTS (SELECT 1 FROM set_intervals i WHERE i.set_id = s.id) AS recorded
+     FROM sets s WHERE s.id = ?`,
     [setId]
   );
   if (!ctx) throw new Error('Set not found');
 
-  const { prepSeconds, reachSeconds } = await getRecordingSettings();
-  const trimmed = Math.max(0, seconds - prepSeconds - reachSeconds);
+  let stored = seconds;
+  if (!ctx.recorded) {
+    const { prepSeconds, reachSeconds } = await getRecordingSettings();
+    stored = Math.max(0, seconds - prepSeconds - reachSeconds);
+  }
+
+  // Оба конца интервала — от одного момента. Раньше начало бралось
+  // отдельным Date.now() уже после запросов к базе, и интервал выходил
+  // короче введённого ровно на время этих запросов: вписанное «30.00»
+  // возвращалось «29.99». Округление до миллисекунды — чтобы 1.005 * 1000
+  // (в двоичном виде 1004.999…) не срезалось до 1004.
+  const endMs = Date.now();
+  const ts = new Date(endMs).toISOString();
+  const startedAt = new Date(endMs - Math.round(stored * 1000)).toISOString();
 
   await db.withTransactionAsync(async () => {
     await db.runAsync(
@@ -433,7 +450,7 @@ export async function recordSetSeconds(setId: number, seconds: number): Promise<
     await db.runAsync('DELETE FROM set_intervals WHERE set_id = ?', [setId]);
     await db.runAsync(
       'INSERT INTO set_intervals (set_id, started_at, ended_at) VALUES (?, ?, ?)',
-      [setId, shifted(-trimmed), ts]
+      [setId, startedAt, ts]
     );
   });
 }

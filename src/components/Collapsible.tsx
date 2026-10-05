@@ -10,6 +10,15 @@ import { Animated, View } from 'react-native';
  *
  * Содержимое остаётся смонтированным и в свёрнутом виде: иначе его нечем
  * измерить, и разворачивать было бы не из чего.
+ *
+ * Анимированная высота живёт только на время самого движения, а в покое
+ * отдаётся обычным числом через React. Анимация без нативного драйвера
+ * двигает вид в обход React, и React помнит высоту с момента её начала.
+ * Пока вид никто не трогает, разницы не видно; но карточку, которую
+ * передвинули в списке (например, порядок упражнений пришёл из базы
+ * другим), нативная сторона пересобирает по тому, что помнит React, —
+ * и доехавший до конца разворот откатывался: передвинутая карточка
+ * мгновенно схлопывалась.
  */
 export function Collapsible({
   collapsed,
@@ -22,15 +31,37 @@ export function Collapsible({
 }) {
   const [height, setHeight] = useState<number | null>(null);
   const anim = useRef(new Animated.Value(collapsed ? 0 : 1)).current;
+  const [animating, setAnimating] = useState(false);
+  // К какому положению уже едем или уже приехали. На первом рендере
+  // совпадает с collapsed — двигать нечего.
+  const shown = useRef(collapsed);
+  const current = useRef<Animated.CompositeAnimation | null>(null);
 
   useEffect(() => {
-    Animated.timing(anim, {
+    if (shown.current === collapsed) return;
+    shown.current = collapsed;
+    current.current?.stop();
+    const a = Animated.timing(anim, {
       toValue: collapsed ? 0 : 1,
       duration,
       // высота — layout-свойство, нативный драйвер её не умеет
       useNativeDriver: false,
-    }).start();
+    });
+    current.current = a;
+    setAnimating(true);
+    a.start(({ finished }) => {
+      // прерванную анимацию сменила новая — флаг снимет уже она
+      if (finished) setAnimating(false);
+    });
   }, [collapsed, duration, anim]);
+
+  useEffect(() => () => current.current?.stop(), []);
+
+  // Рендер, в котором collapsed уже сменился, а эффект ещё не запустил
+  // анимацию, тоже считается движением: обычным числом здесь сразу вышло
+  // бы конечное положение, и карточка прыгала бы туда, а потом ехала
+  // обратно от старого.
+  const moving = animating || shown.current !== collapsed;
 
   // Пока не было ни одного замера и карточка свёрнута с самого монтирования
   // (типичный случай: открыл экран, а упражнение уже отмечено готовым) -
@@ -53,7 +84,11 @@ export function Collapsible({
             ? collapsed
               ? 0
               : undefined
-            : anim.interpolate({ inputRange: [0, 1], outputRange: [0, height] }),
+            : moving
+              ? anim.interpolate({ inputRange: [0, 1], outputRange: [0, height] })
+              : collapsed
+                ? 0
+                : height,
         overflow: 'hidden',
       }}
     >

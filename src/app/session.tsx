@@ -52,7 +52,7 @@ import { useT } from '../lib/i18n';
 import { hasRir, rirOf } from '../lib/rir';
 import { fmtKg } from '../lib/load';
 import { localizeWorkoutName } from '../lib/workoutName';
-import { fmtMs, liveSeconds, useNow } from '../lib/time';
+import { fmtMs, useNow, useReached } from '../lib/time';
 import {
   HEADER_DONE,
   HEADER_DONE_PAUSED,
@@ -184,26 +184,25 @@ export default function Session() {
 
   const unrecorded = rows.filter((s) => !recorded(s)).length;
 
-  // во время перетаскивания тикающий таймер перерисовывал бы весь список
-  const now = useNow(workout !== null && !dragging);
-
-  /** Отсчёт перед стартом ещё идёт: began_at стоит в будущем. */
-  const counting = clockSet && beganMs > now;
-  /** Тренировка идёт по-настоящему: отсчёт позади. */
-  const live = clockSet && !counting;
-
-  /**
-   * Момент окончания отсчёта надо поймать точно, а общий тик идёт раз в
-   * полсекунды — на глаз это заметная задержка смены подписей на кнопках.
-   * Отдельный таймер ровно на остаток отсчёта перерисовывает экран в тот
-   * самый момент.
+  /*
+   * Общего тикающего «сейчас» на экран больше нет. Он дважды в секунду
+   * перерисовывал весь список с полями ввода — и бегущие сотые таймера
+   * спотыкались ровно на этих перерисовках. От времени здесь зависят только
+   * разовые переключения, и каждое ловится ровно в свой момент. Всё, что
+   * бежит, тикает само у себя: LiveTimer и CountdownSeconds.
    */
-  const [, setCountdownTick] = useState(0);
-  useEffect(() => {
-    if (!counting) return;
-    const id = setTimeout(() => setCountdownTick((n) => n + 1), Math.max(0, beganMs - Date.now()));
-    return () => clearTimeout(id);
-  }, [counting, beganMs]);
+  const begun = useReached(clockSet ? beganMs : null);
+  /** Отсчёт перед стартом ещё идёт: began_at стоит в будущем. */
+  const counting = clockSet && !begun;
+  /** Тренировка идёт по-настоящему: отсчёт позади. */
+  const live = clockSet && begun;
+
+  /** Подход идёт пятую минуту — скорее всего, его забыли остановить. */
+  const longRun = useReached(
+    running?.running_since
+      ? Date.parse(running.running_since) - running.active_seconds * 1000 + 5 * 60 * 1000
+      : null
+  );
 
 
   // Каждый await рвёт автобатчинг React 18 - если звать setState между
@@ -723,7 +722,6 @@ export default function Session() {
                                   row={s}
                                   locked={locked && s.is_running !== 1}
                                   timed={isTimed(s)}
-                                  seconds={liveSeconds(s.active_seconds, s.running_since, now)}
                                   onChanged={refresh}
                                   onTyped={onTyped}
                                   bodyweight={bodyweight}
@@ -803,8 +801,7 @@ export default function Session() {
           }}
         />
 
-        {running !== null &&
-          liveSeconds(running.active_seconds, running.running_since, now) > 300 && (
+        {running !== null && longRun && (
             <Text
               style={{
                 color: RED_DARK,
@@ -986,7 +983,13 @@ export default function Session() {
               <Text style={{ color: '#fff', fontWeight: '700', fontSize: 16 }}>
                 {!live
                   ? counting
-                    ? `${t("Let's start")}  ${Math.floor((beganMs - now) / 1000)}`
+                    ? (
+                        <>
+                          {t("Let's start")}
+                          {'  '}
+                          <CountdownSeconds to={beganMs} />
+                        </>
+                      )
                     : t("Let's start")
                   : confirmFinish
                     ? t('Finish anyway')
@@ -1066,6 +1069,16 @@ export default function Session() {
   );
 }
 
+/**
+ * Целые секунды до старта. Тикает сам: ради одной цифры на кнопке не
+ * перерисовывать весь экран. Четыре раза в секунду — чтобы смена цифры не
+ * запаздывала заметно на глаз.
+ */
+function CountdownSeconds({ to }: { to: number }) {
+  const now = useNow(true, 250);
+  return <>{Math.max(0, Math.floor((to - now) / 1000))}</>;
+}
+
 /* ------------------------------------------------------------------ */
 /* Всплывающее облако над нижней панелью                               */
 /* ------------------------------------------------------------------ */
@@ -1135,7 +1148,6 @@ function SetLine({
   row,
   locked,
   timed,
-  seconds,
   onChanged,
   onTyped,
   bodyweight,
@@ -1145,8 +1157,6 @@ function SetLine({
   locked: boolean;
   /** Мерить время подхода или просто отмечать выполнение. */
   timed: boolean;
-  /** Уже посчитанное время: родитель пересчитывает его каждые полсекунды. */
-  seconds: number;
   onChanged: () => void;
   /** Введённое прямо сейчас — до того, как оно доедет до базы и обратно. */
   onTyped: (setId: number, patch: { reps?: number | null; weightKg?: number | null }) => void;
@@ -1158,7 +1168,15 @@ function SetLine({
   const { t } = useT();
   const isRunning = row.is_running === 1;
   const isDone = !isRunning && row.started_at !== null;
-  const prepping = timed && row.started_at !== null && seconds < 0;
+  // Первые секунды идущего подхода — ещё подготовка (prepSeconds): начало
+  // интервала стоит в будущем. Переключение одно, и ловится в свой момент,
+  // без тикающего счётчика на каждую строку.
+  const prepEndsAt =
+    timed && isRunning && row.running_since
+      ? Date.parse(row.running_since) - row.active_seconds * 1000
+      : null;
+  const prepDone = useReached(prepEndsAt);
+  const prepping = prepEndsAt !== null && !prepDone;
   const isHold = row.measurement_default === 'hold';
   /**
    * Серое — подставленное из прошлого раза и ещё не подтверждённое,
@@ -1262,7 +1280,6 @@ function SetLine({
         <TextInput
           editable={!locked}
           keyboardType="numeric"
-          placeholder={t('kg')}
           defaultValue={row.weight_kg == null ? '' : String(row.weight_kg)}
           onChangeText={(v) => onTyped(row.id, { weightKg: parseField(v) })}
           onEndEditing={onChanged}
@@ -1274,23 +1291,44 @@ function SetLine({
             color: valueColor,
           }}
         />
+        {/* Единица стоит всегда, а не только подсказкой в пустом поле:
+            как только вписали число, подсказка пропадала, и «12» рядом с
+            «60» было уже не отличить, где вес, а где повторы. */}
+        <Text style={unitStyle}>{t('kg')}</Text>
       </View>
 
       {/* У холда повторов нет: там меряется время, и пустое поле повторов
           рядом с таймером только сбивало бы с толку. */}
       {!isHold && (
-        <TextInput
-          editable={!locked}
-          keyboardType="numeric"
-          placeholder={t('reps')}
-          defaultValue={row.reps == null ? '' : String(row.reps)}
-          onChangeText={(v) => onTyped(row.id, { reps: parseField(v) })}
-          onEndEditing={onChanged}
+        <View
           style={[
             inputStyle,
-            { backgroundColor: locked ? 'transparent' : '#fff', color: valueColor },
+            {
+              flexDirection: 'row',
+              alignItems: 'center',
+              paddingVertical: 0,
+              paddingHorizontal: 0,
+              overflow: 'hidden',
+              backgroundColor: locked ? 'transparent' : '#fff',
+            },
           ]}
-        />
+        >
+          <TextInput
+            editable={!locked}
+            keyboardType="numeric"
+            defaultValue={row.reps == null ? '' : String(row.reps)}
+            onChangeText={(v) => onTyped(row.id, { reps: parseField(v) })}
+            onEndEditing={onChanged}
+            style={{
+              flex: 1,
+              paddingVertical: 6,
+              paddingHorizontal: 6,
+              fontSize: 15,
+              color: valueColor,
+            }}
+          />
+          <Text style={unitStyle}>{t('reps')}</Text>
+        </View>
       )}
 
       {/* Кнопка таймера и значение — одно поле, а не кнопка и поле рядом:
@@ -1380,9 +1418,12 @@ function SetLine({
               // не целый: округление до секунды показывало «5» там, где
               // записано 5.23, — и это ровно то расхождение, из-за
               // которого доли вообще появились на экране.
-              defaultValue={row.started_at ? seconds.toFixed(2) : ''}
+              defaultValue={row.started_at ? row.active_seconds.toFixed(2) : ''}
               onEndEditing={async (e) => {
                 const v = e.nativeEvent.text.trim();
+                // Зашёл в поле и вышел, ничего не поменяв, — это не новая
+                // запись: иначе каждое касание переписывало бы подход заново.
+                if (row.started_at && v === row.active_seconds.toFixed(2)) return;
                 if (v === '') {
                   if (row.started_at) {
                     await unrecordSet(row.id);
@@ -1411,6 +1452,9 @@ function SetLine({
     </Animated.View>
   );
 }
+
+/** Единица измерения внутри поля, после числа. */
+const unitStyle = { paddingRight: 6, fontSize: 13, color: VALUE_PENDING };
 
 const inputStyle = {
   flex: 1,
